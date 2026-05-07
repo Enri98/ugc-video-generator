@@ -1,0 +1,72 @@
+# Internal design doc 
+PIPELINE_PLAN.md
+PIPELINE_PLAN.private.md
+*.private.md
+
+# Brand-specific configs and prompts
+config/brand_guidelines.yaml
+config/talent_pool.yaml
+config/pipeline_config.yaml
+config/*.private.yaml
+
+# Brand-specific prompt templates
+src/prompts/**/*.private.py
+src/prompts/_brand/
+
+# All runtime / brand-specific assets
+assets/
+!assets/.gitkeep
+!assets/README.md
+
+# Runtime state and outputs
+state/
+videos/
+output/
+logs/
+*.log
+
+# 
+# Secrets and credentials
+# 
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+credentials*.json
+client_secret*.json
+token*.json
+
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Misc
+*.tmp
+*.bak
+scratch/
+notes.local.md
+.claude/
