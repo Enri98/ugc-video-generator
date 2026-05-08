@@ -1,0 +1,26 @@
+# Generic talent pool example. Copy to `talent_pool.yaml` (gitignored)
+# and replace with project-specific talent descriptors.
+#
+# Each entry maps a `talent_id` (string) to a descriptor used to render
+# Creative Director and First-Frame Composite prompts. See SPEC.md §6.2/§6.3.
+
+talent_01:
+  gender: "man"
+  age_range: "early 30s"
+  aesthetic: "casual, urban, approachable"
+  camera_relationship: "direct address with brief eye contact"
+  lighting_preference: "soft overcast daylight"
+
+talent_02:
+  gender: "woman"
+  age_range: "late 20s"
+  aesthetic: "natural, relaxed, warm"
+  camera_relationship: "conversational, occasional direct address"
+  lighting_preference: "soft natural window light"
+
+talent_03:
+  gender: "non-binary"
+  age_range: "mid 20s"
+  aesthetic: "minimal, contemplative, quiet"
+  camera_relationship: "ambient — rarely looks at camera"
+  lighting_preference: "low-key, single-source lamp light"
