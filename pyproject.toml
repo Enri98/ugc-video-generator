@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ugc-pipeline"
+version = "0.0.1"
+description = "Automated UGC short-form video generation pipeline."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "ugc-pipeline contributors" }]
+dependencies = [
+    "google-genai>=0.3.0",
+    "google-api-python-client>=2.140.0",
+    "google-auth>=2.34.0",
+    "google-auth-httplib2>=0.2.0",
+    "faster-whisper>=1.0.3",
+    "pillow>=10.4.0",
+    "python-dotenv>=1.0.1",
+    "pydantic>=2.8.0",
+    "tenacity>=9.0.0",
+    "pyyaml>=6.0.2",
+    "structlog>=24.4.0",
+    "aiolimiter>=1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-mock>=3.14.0",
+    "pytest-asyncio>=0.23.8",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+
+[project.scripts]
+ugc-pipeline = "ugc_pipeline.main:cli_entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

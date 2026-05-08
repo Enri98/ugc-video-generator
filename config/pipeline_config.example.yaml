@@ -1,0 +1,48 @@
+# Generic, publishable pipeline configuration example.
+# Copy to `pipeline_config.yaml` and adjust. The brand-specific YAML files
+# (`brand_guidelines.yaml`, `talent_pool.yaml`) are gitignored — see SPEC.md §9.
+
+drive:
+  poll_interval_seconds: 60
+  input_folder_env: GOOGLE_DRIVE_INPUT_FOLDER_ID
+  output_videos_folder_env: GOOGLE_DRIVE_OUTPUT_VIDEOS_FOLDER_ID
+  output_reports_folder_env: GOOGLE_DRIVE_OUTPUT_REPORTS_FOLDER_ID
+  accepted_mime_types:
+    - image/jpeg
+    - image/png
+    - image/webp
+
+concurrency:
+  veo_max_concurrent: 4
+  gemini_rpm: 60
+  nano_banana_rpm: 30
+
+retries:
+  veo_safety_max: 1
+  rate_limit_max: 5
+  rate_limit_initial_backoff_seconds: 2
+
+post_production:
+  trim_tail_seconds: 0.5
+  output_resolution: "1080x1920"
+  output_fps: 30
+
+budget:
+  per_video_max_usd: 8.0
+  global_max_usd: 50.0
+  abort_on_global: true
+
+cleanup:
+  keep_first_frames: true
+  keep_raw_clips: false
+  keep_trimmed_clips: false
+  keep_final_video: true
+
+logging:
+  level: INFO
+  json_file: logs/pipeline.log
+  rotation_bytes: 10485760
+  rotation_backups: 5
+
+dry_run:
+  enabled_by_default: false

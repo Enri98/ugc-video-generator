@@ -51,3 +51,8 @@ ugc-video-generator/
 ## Open design questions
 
 Tracked separately during spec-driven development.
+
+## Authoritative specification
+
+The full design is maintained in [`SPEC.md`](./SPEC.md). Implementation tracks
+that document; any divergence is a bug in one or the other.

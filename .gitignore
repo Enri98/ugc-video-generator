@@ -1,7 +1,19 @@
-# Internal design doc 
+# Internal development 
 PIPELINE_PLAN.md
 PIPELINE_PLAN.private.md
 *.private.md
+SPEC.md
+DESIGN.md
+PROGRESS.md
+ROADMAP.md
+PLAN.md
+NOTES.md
+*_PLAN.md
+*_SPEC.md
+*_DESIGN.md
+*_NOTES.md
+CLAUDE.md
+
 
 # Brand-specific configs and prompts
 config/brand_guidelines.yaml
@@ -17,6 +29,7 @@ src/prompts/_brand/
 assets/
 !assets/.gitkeep
 !assets/README.md
+fixtures/
 
 # Runtime state and outputs
 state/
