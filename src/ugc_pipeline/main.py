@@ -86,8 +86,12 @@ def cli_entry(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     # Build clients
-    google_api_key = os.environ.get("GOOGLE_API_KEY", "")
-    creds_path_str = os.environ.get("GOOGLE_DRIVE_CREDENTIALS_PATH", "")
+    gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    gcp_location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    creds_path_str = os.environ.get(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        os.environ.get("GOOGLE_DRIVE_CREDENTIALS_PATH", ""),
+    )
     input_folder_id = os.environ.get("GOOGLE_DRIVE_INPUT_FOLDER_ID", "")
     output_videos_folder_id = os.environ.get("GOOGLE_DRIVE_OUTPUT_VIDEOS_FOLDER_ID", "")
     output_reports_folder_id = os.environ.get("GOOGLE_DRIVE_OUTPUT_REPORTS_FOLDER_ID", "")
@@ -120,7 +124,16 @@ def cli_entry(argv: list[str] | None = None) -> None:
         gemini_pro_client.generate_content = AsyncMock(return_value=MagicMock(text="{}", usage_metadata=None))
     else:
         from ugc_pipeline.steps.product_analyst import make_default_client as _make_gemini
-        gemini_pro_client = _make_gemini(google_api_key)
+        if not (gcp_project and creds_path_str):
+            log.critical("vertex_config_missing", project=bool(gcp_project), creds=bool(creds_path_str))
+            print(
+                "ERROR: Vertex AI requires GOOGLE_CLOUD_PROJECT and a service account JSON.\n"
+                "Set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION (default us-central1),\n"
+                "and GOOGLE_APPLICATION_CREDENTIALS in .env.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        gemini_pro_client = _make_gemini(gcp_project, gcp_location, creds_path_str)
 
     # Nano Banana client
     if mock_everything or dry_run:
@@ -132,7 +145,7 @@ def cli_entry(argv: list[str] | None = None) -> None:
         )
     else:
         from ugc_pipeline.steps.first_frame import make_default_client as _make_nb
-        nano_banana_client = _make_nb(google_api_key)
+        nano_banana_client = _make_nb(gcp_project, gcp_location, creds_path_str)
 
     # Veo client
     if mock_everything or dry_run:

@@ -1,7 +1,7 @@
 """Integration test for the creative director step.
 
-Requires a live GOOGLE_API_KEY and UGC_RUN_PAID_TESTS=1 to run.
-Uses an inline ProductBrief fixture (no vision call needed).
+Requires Vertex AI credentials (GOOGLE_CLOUD_PROJECT + GOOGLE_APPLICATION_CREDENTIALS)
+and UGC_RUN_PAID_TESTS=1 to run. Uses an inline ProductBrief fixture (no vision call needed).
 """
 
 from __future__ import annotations
@@ -48,10 +48,16 @@ _FIXTURE_BRIEF = ProductBrief(
 @pytest.mark.paid
 async def test_creative_director_live(tmp_path: pathlib.Path) -> None:
     """Call the real Gemini 2.5 Pro text endpoint and validate the three VideoSpecs."""
-    api_key = os.environ.get("GOOGLE_API_KEY", "")
-    assert api_key, "GOOGLE_API_KEY must be set for paid integration tests"
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    creds_path = os.environ.get(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        os.environ.get("GOOGLE_DRIVE_CREDENTIALS_PATH", ""),
+    )
+    assert project, "GOOGLE_CLOUD_PROJECT must be set for paid integration tests"
+    assert creds_path, "GOOGLE_APPLICATION_CREDENTIALS must point at the service account JSON"
 
-    client = make_default_client(api_key)
+    client = make_default_client(project, location, creds_path)
     run_state = RunState(
         run_id="integration-cd-run",
         started_at=datetime.now(timezone.utc),

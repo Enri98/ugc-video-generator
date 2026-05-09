@@ -70,17 +70,52 @@ class GeminiClientProtocol(Protocol):
     ) -> object: ...
 
 
-def make_default_client(api_key: str) -> Any:
-    """Return the real google.genai async models interface.
+class _AioModelsAdapter:
+    """Thin wrapper that holds a strong reference to the parent ``genai.Client``.
+
+    Returning ``client.aio.models`` directly causes the parent client (and its
+    async httpx pool) to be garbage-collected, which closes the connection
+    mid-request. Holding the parent here keeps it alive for the caller's lifetime.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self._models = client.aio.models
+
+    async def generate_content(self, **kwargs: Any) -> Any:
+        return await self._models.generate_content(**kwargs)
+
+
+def make_default_client(
+    project: str,
+    location: str,
+    credentials_path: str | pathlib.Path,
+) -> Any:
+    """Return an async Gemini client adapter authenticated via service account.
 
     Usage::
 
-        client = make_default_client(os.environ["GOOGLE_API_KEY"])
+        client = make_default_client(
+            project=os.environ["GOOGLE_CLOUD_PROJECT"],
+            location=os.environ["GOOGLE_CLOUD_LOCATION"],
+            credentials_path=os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
+        )
         response = await client.generate_content(model=..., contents=..., config=...)
     """
     from google import genai  # type: ignore[import-untyped]
+    from google.oauth2 import service_account  # type: ignore[import-untyped]
 
-    return genai.Client(api_key=api_key).aio.models
+    credentials = service_account.Credentials.from_service_account_file(
+        str(credentials_path),
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    raw_client = genai.Client(
+        vertexai=True,
+        project=project,
+        location=location,
+        credentials=credentials,
+    )
+    return _AioModelsAdapter(raw_client)
 
 
 # ---------------------------------------------------------------------------

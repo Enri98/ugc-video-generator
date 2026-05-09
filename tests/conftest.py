@@ -18,6 +18,12 @@ from typing import Generator
 
 import pytest
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Marker registration

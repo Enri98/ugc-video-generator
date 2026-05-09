@@ -1,7 +1,8 @@
 """Integration test for the product analyst step.
 
-Requires a live GOOGLE_API_KEY and UGC_RUN_PAID_TESTS=1 to run.
-Uses a PIL-generated brand-neutral PNG so no real product image is needed.
+Requires Vertex AI credentials (GOOGLE_CLOUD_PROJECT + GOOGLE_APPLICATION_CREDENTIALS)
+and UGC_RUN_PAID_TESTS=1 to run. Uses a PIL-generated brand-neutral PNG so no real
+product image is needed.
 """
 
 from __future__ import annotations
@@ -22,13 +23,19 @@ async def test_product_analyst_live(
     tmp_path: pathlib.Path,
 ) -> None:
     """Call the real Gemini 2.5 Pro vision endpoint and validate the returned brief."""
-    api_key = os.environ.get("GOOGLE_API_KEY", "")
-    assert api_key, "GOOGLE_API_KEY must be set for paid integration tests"
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    creds_path = os.environ.get(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        os.environ.get("GOOGLE_DRIVE_CREDENTIALS_PATH", ""),
+    )
+    assert project, "GOOGLE_CLOUD_PROJECT must be set for paid integration tests"
+    assert creds_path, "GOOGLE_APPLICATION_CREDENTIALS must point at the service account JSON"
 
     image_bytes = sample_product_image_path.read_bytes()
     expected_product_id = hashlib.sha256(image_bytes).hexdigest()[:12]
 
-    client = make_default_client(api_key)
+    client = make_default_client(project, location, creds_path)
     run_state = RunState(
         run_id="integration-test-run",
         started_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),

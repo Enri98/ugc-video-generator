@@ -79,10 +79,25 @@ class _DefaultNanoBananaClient:
     # TODO Day 8: validate against google-genai 2.0 image API surface.
     """
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(
+        self,
+        project: str,
+        location: str,
+        credentials_path: str,
+    ) -> None:
         from google import genai  # type: ignore[import-untyped]
+        from google.oauth2 import service_account  # type: ignore[import-untyped]
 
-        self._client = genai.Client(api_key=api_key)
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        self._client = genai.Client(
+            vertexai=True,
+            project=project,
+            location=location,
+            credentials=credentials,
+        )
 
     async def generate_image(
         self,
@@ -110,12 +125,20 @@ class _DefaultNanoBananaClient:
         return NanoBananaResult(png_bytes=png_bytes, model=model)
 
 
-def make_default_client(api_key: str) -> _DefaultNanoBananaClient:
-    """Return the default Nano Banana 2 client adapter.
+def make_default_client(
+    project: str,
+    location: str,
+    credentials_path: str,
+) -> _DefaultNanoBananaClient:
+    """Return the default Nano Banana 2 client adapter, authenticated via service account.
 
     Pass the returned object as the *client* argument to run_first_frame_for_clip.
     """
-    return _DefaultNanoBananaClient(api_key=api_key)
+    return _DefaultNanoBananaClient(
+        project=project,
+        location=location,
+        credentials_path=credentials_path,
+    )
 
 
 # ---------------------------------------------------------------------------
