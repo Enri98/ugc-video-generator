@@ -1,0 +1,47 @@
+# Copy to `scripts/adhoc/adhoc_inputs.yaml` (gitignored) and edit to taste.
+#
+# This drives `scripts/adhoc/make_video.py`, which generates a single longer
+# stitched video from 2 or 3 clips, then burns Italian captions on top —
+# without invoking the full pipeline (no Drive trigger, no creative director,
+# no Nano Banana).
+#
+# CONTRACT enforced by the script:
+#   - The 'clips' list must have exactly 2 or 3 entries.
+#   - The SECOND clip (index 1) is the one that speaks. All other clips MUST
+#     be silent ("[silent]" or empty).
+#   - Each clip carries its own Veo prompt and the path to a PNG reference
+#     image (JPEG/WebP are auto-converted via Pillow).
+#
+# Total runtime = sum of `duration_seconds`. With 3 × 8s clips you get a
+# 24-second video; with 2 × 8s, 16 seconds.
+
+video_id: "adhoc-001"            # arbitrary identifier; controls output dir
+tone: "calm"                      # informational only; not sent to Veo
+narrative_arc: "demo -> close"    # informational only; not sent to Veo
+
+clips:
+  # Clip 0 — silent intro shot.
+  - prompt: |
+      Static lifestyle shot, daylight, neutral background. The talent holds a
+      small ceramic coffee cup with branded packaging at chest height and
+      glances at it briefly before looking back at the camera.
+    image_path: "./assets/adhoc/clip0_firstframe.png"
+    duration_seconds: 8
+    speech: "[silent]"
+
+  # Clip 1 — the SPEAKING clip. This is the only place 'speech' may be set.
+  - prompt: |
+      Same talent, slightly closer framing. They smile and speak directly to
+      the camera while gently rotating the cup so the packaging label is
+      visible.
+    image_path: "./assets/adhoc/clip1_firstframe.png"
+    duration_seconds: 8
+    speech: "Provo questo nuovo prodotto da una settimana e mi trovo benissimo."
+
+  # Clip 2 — silent close. Remove this entry entirely for a 2-clip video.
+  - prompt: |
+      Wider framing, talent sets the cup down on a wooden surface and offers
+      a small approving nod toward the camera. Same lighting and wardrobe.
+    image_path: "./assets/adhoc/clip2_firstframe.png"
+    duration_seconds: 8
+    speech: "[silent]"

@@ -13,7 +13,12 @@ import uuid
 import pytest
 
 from ugc_pipeline.models import CostBreakdown, VideoState
-from ugc_pipeline.steps.stitch import _normalise_audio_streams, cleanup_after_step, run_stitch
+from ugc_pipeline.steps.stitch import (
+    _build_xfade_args,
+    _normalise_audio_streams,
+    cleanup_after_step,
+    run_stitch,
+)
 from ugc_pipeline.utils.ffmpeg import ffprobe_duration_seconds, ffprobe_has_audio, run_ffmpeg
 
 
@@ -563,3 +568,218 @@ def test_cleanup_after_step_keeps_silenced_when_keep_trimmed_true(tmp_path: path
 
     assert "clip_0_silenced" in video_state.artifacts
     assert silenced.exists()
+
+
+# ---------------------------------------------------------------------------
+# _build_xfade_args — pure-function unit tests (no ffmpeg needed)
+# ---------------------------------------------------------------------------
+
+
+def test_build_xfade_args_two_clips_with_audio(tmp_path: pathlib.Path) -> None:
+    """2 clips × 8 s, transition 0.4 s — verify xfade offset and arg structure."""
+    clip0 = tmp_path / "clip_0.mp4"
+    clip1 = tmp_path / "clip_1.mp4"
+    clip0.touch()
+    clip1.touch()
+    out = tmp_path / "stitched.mp4"
+
+    args = _build_xfade_args(
+        clip_paths=[clip0, clip1],
+        clip_durations=[8.0, 8.0],
+        has_audio=True,
+        transition_seconds=0.4,
+        out_path=out,
+    )
+
+    # Verify -i flags
+    assert "-i" in args
+    assert str(clip0) in args
+    assert str(clip1) in args
+
+    # Verify filter_complex contains xfade with correct offset (8.0 - 0.4*1 = 7.6)
+    fc_index = args.index("-filter_complex")
+    fc_value = args[fc_index + 1]
+    assert "xfade=transition=fade:duration=0.4:offset=7.6" in fc_value
+
+    # Verify acrossfade is included when has_audio=True
+    assert "acrossfade=d=0.4" in fc_value
+
+    # Verify output path and encode flags
+    assert str(out) in args
+    assert "libx264" in args
+    assert "aac" in args
+
+
+def test_build_xfade_args_two_clips_no_audio(tmp_path: pathlib.Path) -> None:
+    """2 clips, no audio — acrossfade must be absent; -c:a must be absent."""
+    clip0 = tmp_path / "clip_0.mp4"
+    clip1 = tmp_path / "clip_1.mp4"
+    clip0.touch()
+    clip1.touch()
+    out = tmp_path / "stitched.mp4"
+
+    args = _build_xfade_args(
+        clip_paths=[clip0, clip1],
+        clip_durations=[8.0, 8.0],
+        has_audio=False,
+        transition_seconds=0.4,
+        out_path=out,
+    )
+
+    fc_index = args.index("-filter_complex")
+    fc_value = args[fc_index + 1]
+
+    # xfade present, acrossfade absent
+    assert "xfade" in fc_value
+    assert "acrossfade" not in fc_value
+
+    # No -c:a flag at all
+    assert "-c:a" not in args
+    assert "aac" not in args
+
+
+def test_build_xfade_args_three_clips_offset_formula(tmp_path: pathlib.Path) -> None:
+    """3 clips × 8 s, transition 0.3 s — verify both xfade offsets."""
+    clips = [tmp_path / f"clip_{i}.mp4" for i in range(3)]
+    for c in clips:
+        c.touch()
+    out = tmp_path / "stitched.mp4"
+
+    args = _build_xfade_args(
+        clip_paths=clips,
+        clip_durations=[8.0, 8.0, 8.0],
+        has_audio=False,
+        transition_seconds=0.3,
+        out_path=out,
+    )
+
+    fc_index = args.index("-filter_complex")
+    fc_value = args[fc_index + 1]
+
+    # First xfade: offset = 8.0 - 0.3*1 = 7.7
+    assert "xfade=transition=fade:duration=0.3:offset=7.7" in fc_value
+    # Second xfade: offset = (8.0 + 8.0) - 0.3*2 = 15.4
+    assert "xfade=transition=fade:duration=0.3:offset=15.4" in fc_value
+
+
+# ---------------------------------------------------------------------------
+# Crossfade integration tests (real ffmpeg, real fixture clips)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_stitch_with_crossfade_two_clips(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """2 clips × 8 s with 0.4 s crossfade → expected duration ~15.6 s (±0.5 s)."""
+    video_state = _make_video_state()
+    _setup_two_trimmed_clips(clip_fixture_mp4_path, tmp_path, video_state)
+
+    out_path = await run_stitch(
+        video_state,
+        artifacts_root=tmp_path,
+        cleanup_raw=False,
+        cleanup_trimmed=False,
+        transition_seconds=0.4,
+    )
+
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
+
+    duration = ffprobe_duration_seconds(out_path)
+    expected = 8.0 + 8.0 - 0.4
+    assert abs(duration - expected) < 0.5, (
+        f"Expected ~{expected}s, got {duration}s"
+    )
+
+    assert video_state.artifacts.get("stitched") == str(out_path)
+
+
+@pytest.mark.asyncio
+async def test_run_stitch_with_crossfade_three_clips(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """3 clips × 8 s with 0.3 s crossfade → expected duration ~23.4 s (±0.5 s)."""
+    video_state = _make_video_state()
+    video_dir = tmp_path / video_state.video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(3):
+        dst = video_dir / f"clip_{i}_trimmed.mp4"
+        shutil.copy2(clip_fixture_mp4_path, dst)
+        video_state.artifacts[f"clip_{i}_trimmed"] = str(dst)
+
+    out_path = await run_stitch(
+        video_state,
+        artifacts_root=tmp_path,
+        cleanup_raw=False,
+        cleanup_trimmed=False,
+        transition_seconds=0.3,
+    )
+
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
+
+    duration = ffprobe_duration_seconds(out_path)
+    expected = 8.0 * 3 - 0.3 * 2
+    assert abs(duration - expected) < 0.5, (
+        f"Expected ~{expected}s, got {duration}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_stitch_with_crossfade_no_audio_skips_acrossfade(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Silent clips + crossfade → output has no audio stream, correct video duration."""
+    # clip_fixture_mp4_path is already silent (no audio stream)
+    video_state = _make_video_state()
+    _setup_two_trimmed_clips(clip_fixture_mp4_path, tmp_path, video_state)
+
+    out_path = await run_stitch(
+        video_state,
+        artifacts_root=tmp_path,
+        cleanup_raw=False,
+        cleanup_trimmed=False,
+        transition_seconds=0.4,
+    )
+
+    assert out_path.exists()
+    assert ffprobe_has_audio(out_path) is False
+
+    duration = ffprobe_duration_seconds(out_path)
+    expected = 8.0 + 8.0 - 0.4
+    assert abs(duration - expected) < 0.5, (
+        f"Expected ~{expected}s, got {duration}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_stitch_zero_transition_uses_concat_path(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """transition_seconds=0.0 (default) uses the fast concat-demuxer path → ~16 s output."""
+    video_state = _make_video_state()
+    _setup_two_trimmed_clips(clip_fixture_mp4_path, tmp_path, video_state)
+
+    out_path = await run_stitch(
+        video_state,
+        artifacts_root=tmp_path,
+        cleanup_raw=False,
+        cleanup_trimmed=False,
+        transition_seconds=0.0,
+    )
+
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
+
+    duration = ffprobe_duration_seconds(out_path)
+    assert abs(duration - 16.0) < 0.5, f"Unexpected duration: {duration}"
+
+    # concat demuxer writes a concat_list.txt; xfade path does not
+    video_dir = tmp_path / video_state.video_id
+    assert (video_dir / "concat_list.txt").exists()

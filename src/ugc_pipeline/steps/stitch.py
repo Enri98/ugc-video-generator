@@ -3,9 +3,8 @@
 Implements SPEC.md §5 Step 8 — stitch.
 
 Concatenates all trimmed clips for a video into a single stitched MP4 using
-the ffmpeg concat demuxer. After a successful stitch, raw and trimmed clips
-may be deleted per the cleanup policy flags passed to
-:func:`cleanup_after_step`.
+either the ffmpeg concat demuxer (fast, lossless, hard cuts) or an xfade/
+acrossfade filter chain (re-encodes, crossfade transitions).
 
 The step is idempotent: if the ``stitched`` artifact already exists on disk
 with a non-zero size, the ffmpeg call is skipped.
@@ -21,7 +20,13 @@ from pathlib import Path
 import structlog
 
 from ugc_pipeline.models import VideoState
-from ugc_pipeline.utils.ffmpeg import FfmpegError, ffprobe_has_audio, quote_concat_path, run_ffmpeg
+from ugc_pipeline.utils.ffmpeg import (
+    FfmpegError,
+    ffprobe_duration_seconds,
+    ffprobe_has_audio,
+    quote_concat_path,
+    run_ffmpeg,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -210,6 +215,117 @@ def cleanup_after_step(
 
 
 # ---------------------------------------------------------------------------
+# Crossfade (xfade / acrossfade) helper
+# ---------------------------------------------------------------------------
+
+
+def _build_xfade_args(
+    clip_paths: list[Path],
+    clip_durations: list[float],
+    has_audio: bool,
+    transition_seconds: float,
+    out_path: Path,
+) -> list[str]:
+    """Build ffmpeg args for an xfade-based stitch.
+
+    Pure function for testability: given N clips with their probed durations,
+    constructs a ``-filter_complex`` chain that crossfades adjacent clips
+    using the ``xfade`` (video) and ``acrossfade`` (audio) filters.
+
+    Transition style: ``fade`` (simple cross-dissolve).
+
+    Offset formula: the xfade offset for clip pair (k, k+1) is the cumulative
+    duration of clips 0..k minus ``transition_seconds * k`` (i.e. the wall-clock
+    position where the outgoing clip's fade starts, accounting for all previous
+    overlaps).
+
+    Parameters
+    ----------
+    clip_paths:
+        Ordered list of clip paths (N ≥ 2).
+    clip_durations:
+        Per-clip duration in seconds (same order as *clip_paths*).
+    has_audio:
+        True if all clips have an audio stream; False if all clips are silent.
+    transition_seconds:
+        Crossfade overlap duration in seconds (> 0).
+    out_path:
+        Destination file path for the stitched MP4.
+
+    Returns
+    -------
+    list[str]
+        Complete ffmpeg argument list (excluding the ffmpeg binary itself).
+    """
+    n = len(clip_paths)
+
+    # Input flags — one -i per clip
+    input_args: list[str] = []
+    for p in clip_paths:
+        input_args += ["-i", str(p)]
+
+    # Build filter_complex
+    # Each xfade node receives the previous output label and the next raw input.
+    # offset(k) = sum(durations[0..k]) - transition_seconds * k
+    filter_parts: list[str] = []
+    cumulative = 0.0
+
+    # Label for the current video chain output; starts as raw [0:v]
+    cur_v = "[0:v]"
+    cur_a = "[0:a]" if has_audio else None
+
+    for k in range(n - 1):
+        cumulative += clip_durations[k]
+        offset = cumulative - transition_seconds * (k + 1)
+        # Clamp offset to a small positive value to avoid negative offsets on
+        # very short clips or very large transition_seconds values.
+        offset = max(offset, 0.001)
+        offset_str = f"{offset:.6f}"
+
+        next_v = f"[{k + 1}:v]"
+        out_v = f"[v{k + 1}]" if k < n - 2 else "[vout]"
+
+        filter_parts.append(
+            f"{cur_v}{next_v}xfade=transition=fade:duration={transition_seconds}:offset={offset_str}{out_v}"
+        )
+        cur_v = out_v
+
+        if has_audio:
+            next_a = f"[{k + 1}:a]"
+            out_a = f"[a{k + 1}]" if k < n - 2 else "[aout]"
+            filter_parts.append(
+                f"{cur_a}{next_a}acrossfade=d={transition_seconds}:c1=tri:c2=tri{out_a}"
+            )
+            cur_a = out_a
+
+    filter_complex = ";".join(filter_parts)
+
+    # Map flags
+    map_args: list[str] = ["-map", "[vout]"]
+    if has_audio:
+        map_args += ["-map", "[aout]"]
+
+    # Encode flags
+    encode_args: list[str] = [
+        "-c:v", "libx264",
+        "-crf", "18",
+        "-preset", "medium",
+        "-pix_fmt", "yuv420p",
+    ]
+    if has_audio:
+        encode_args += ["-c:a", "aac", "-b:a", "192k"]
+
+    return (
+        ["-y"]
+        + input_args
+        + ["-filter_complex", filter_complex]
+        + map_args
+        + encode_args
+        + [str(out_path)]
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -220,6 +336,7 @@ async def run_stitch(
     artifacts_root: Path,
     cleanup_raw: bool = True,
     cleanup_trimmed: bool = True,
+    transition_seconds: float = 0.0,
 ) -> Path:
     """Concatenate trimmed clips into a single stitched MP4.
 
@@ -235,6 +352,11 @@ async def run_stitch(
     cleanup_trimmed:
         If True (default), delete ``clip_{i}_trimmed`` files and remove
         their artifact keys after a successful stitch.
+    transition_seconds:
+        Crossfade overlap duration in seconds.  ``0.0`` (default) uses the
+        fast concat-demuxer path (no re-encode, hard cuts).  Any value > 0
+        enables the xfade/acrossfade filter chain (re-encodes video to H.264
+        CRF 18 and audio to AAC 192 k; adds ~10–30 s wall-clock per video).
 
     Returns
     -------
@@ -293,30 +415,56 @@ async def run_stitch(
         clip_paths, video_dir, video_state=video_state, clip_indices=indices
     )
 
-    # ------------------------------------------------------------------
-    # Write concat list
-    # ------------------------------------------------------------------
-    concat_list = video_dir / "concat_list.txt"
-
-    # ffmpeg's concat demuxer resolves relative entries against the concat
-    # file's directory, not the CWD — so we always write absolute paths to
-    # avoid a doubled-prefix lookup when artifacts_root itself is relative.
-    lines = [f"file {quote_concat_path(p.resolve())}" for p in clip_paths]
-    concat_list.write_text("\n".join(lines), encoding="utf-8")
-
-    # ------------------------------------------------------------------
-    # Run ffmpeg concat
-    # ------------------------------------------------------------------
     out_path = video_dir / "stitched.mp4"
-    args = [
-        "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(concat_list),
-        "-c", "copy",
-        str(out_path),
-    ]
-    await run_ffmpeg(args)
+
+    use_xfade = transition_seconds > 0.0 and len(clip_paths) >= 2
+
+    if use_xfade:
+        # ------------------------------------------------------------------
+        # Crossfade path: xfade (video) + acrossfade (audio) filter chain
+        # ------------------------------------------------------------------
+        # Probe each clip's duration for offset calculation.
+        clip_durations = [ffprobe_duration_seconds(p) for p in clip_paths]
+
+        # Determine audio presence (homogeneous after _normalise_audio_streams).
+        has_audio = ffprobe_has_audio(clip_paths[0])
+
+        args = _build_xfade_args(
+            clip_paths=clip_paths,
+            clip_durations=clip_durations,
+            has_audio=has_audio,
+            transition_seconds=transition_seconds,
+            out_path=out_path,
+        )
+        log.info(
+            "stitch_xfade",
+            clip_count=len(clip_paths),
+            transition_seconds=transition_seconds,
+            has_audio=has_audio,
+            video_id=video_state.video_id,
+        )
+        await run_ffmpeg(args)
+    else:
+        # ------------------------------------------------------------------
+        # Fast path: concat demuxer — no re-encode, hard cuts
+        # ------------------------------------------------------------------
+        concat_list = video_dir / "concat_list.txt"
+
+        # ffmpeg's concat demuxer resolves relative entries against the concat
+        # file's directory, not the CWD — so we always write absolute paths to
+        # avoid a doubled-prefix lookup when artifacts_root itself is relative.
+        lines = [f"file {quote_concat_path(p.resolve())}" for p in clip_paths]
+        concat_list.write_text("\n".join(lines), encoding="utf-8")
+
+        args = [
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy",
+            str(out_path),
+        ]
+        await run_ffmpeg(args)
 
     # ------------------------------------------------------------------
     # Update artifacts

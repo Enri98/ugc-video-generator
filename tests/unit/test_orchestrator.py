@@ -977,3 +977,246 @@ async def test_step_first_frame_source_image_missing_degrades_gracefully(
     # All calls should have source_image_bytes=None (degraded path)
     for call in nb_client.generate_image.call_args_list:
         assert call.kwargs.get("source_image_bytes") is None
+
+
+# ---------------------------------------------------------------------------
+# _step_stitch — transition_seconds plumbing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_step_stitch_passes_transition_seconds_from_config(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_step_stitch reads transition_seconds from cfg and passes it to run_stitch."""
+    from ugc_pipeline.orchestrator import _step_stitch
+
+    product_id = "stitch_transition_product"
+    spec = _video_spec(product_id, spec_index=0, clip_count=2)
+    brief = _product_brief(product_id, tmp_path)
+    run_state = _run_state()
+    video_state = VideoState(
+        video_id=spec.video_id,
+        product_id=product_id,
+        spec_index=0,
+    )
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir(parents=True, exist_ok=True)
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    nb_client = _make_mock_nano_banana(_FAKE_PNG)
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+
+    # Inject transition_seconds into cfg
+    ctx.cfg["post_production"]["transition_seconds"] = 0.4
+
+    with patch("ugc_pipeline.steps.stitch.run_stitch") as mock_run_stitch:
+        mock_run_stitch.return_value = tmp_path / "stitched.mp4"
+        with patch("ugc_pipeline.steps.stitch.cleanup_after_step"):
+            await _step_stitch(video_state, spec, brief, run_state, ctx)
+
+    mock_run_stitch.assert_called_once()
+    call_kwargs = mock_run_stitch.call_args.kwargs
+    assert call_kwargs.get("transition_seconds") == pytest.approx(0.4)
+
+
+@pytest.mark.asyncio
+async def test_step_stitch_defaults_transition_to_zero(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_step_stitch defaults transition_seconds to 0.0 when absent from config."""
+    from ugc_pipeline.orchestrator import _step_stitch
+
+    product_id = "stitch_default_product"
+    spec = _video_spec(product_id, spec_index=0, clip_count=2)
+    brief = _product_brief(product_id, tmp_path)
+    run_state = _run_state()
+    video_state = VideoState(
+        video_id=spec.video_id,
+        product_id=product_id,
+        spec_index=0,
+    )
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir(parents=True, exist_ok=True)
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    nb_client = _make_mock_nano_banana(_FAKE_PNG)
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+
+    # Ensure transition_seconds is absent from post_production config
+    ctx.cfg["post_production"].pop("transition_seconds", None)
+
+    with patch("ugc_pipeline.steps.stitch.run_stitch") as mock_run_stitch:
+        mock_run_stitch.return_value = tmp_path / "stitched.mp4"
+        with patch("ugc_pipeline.steps.stitch.cleanup_after_step"):
+            await _step_stitch(video_state, spec, brief, run_state, ctx)
+
+    mock_run_stitch.assert_called_once()
+    call_kwargs = mock_run_stitch.call_args.kwargs
+    assert call_kwargs.get("transition_seconds") == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# drive_upload.enabled config flag tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_step_drive_upload_skipped_when_disabled(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When drive_upload.enabled=False, the step must set status=completed_local and skip upload."""
+    from ugc_pipeline.orchestrator import _step_drive_upload
+    from ugc_pipeline.state_manager import load_video_state
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir(parents=True, exist_ok=True)
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    product_id = "drive_disabled_product"
+    spec = _video_spec(product_id, spec_index=0, clip_count=2)
+    brief = _product_brief(product_id, tmp_path)
+
+    video_state = VideoState(
+        video_id=spec.video_id,
+        product_id=product_id,
+        spec_index=0,
+    )
+    run_state = _run_state()
+
+    save_video_state(video_state, root=state_root)
+    save_run_state(run_state, root=state_root)
+
+    drive_mock = MagicMock()
+    drive_mock.upload_file = AsyncMock()
+
+    nb_client = _make_mock_nano_banana(_FAKE_PNG)
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+    ctx.cfg["drive_upload"] = {"enabled": False}
+    ctx.drive_client = drive_mock
+
+    await _step_drive_upload(video_state, spec, brief, run_state, ctx)
+
+    # (a) status must be completed_local
+    assert video_state.status == "completed_local", (
+        f"Expected 'completed_local', got {video_state.status!r}"
+    )
+    # (b) drive upload must NOT have been called
+    drive_mock.upload_file.assert_not_called()
+    # (c) state was persisted — reload from disk and verify
+    persisted = load_video_state(spec.video_id, state_root)
+    assert persisted.status == "completed_local"
+
+
+@pytest.mark.asyncio
+async def test_step_drive_upload_runs_when_enabled(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When drive_upload.enabled=True, the early-return path must NOT fire."""
+    from ugc_pipeline.orchestrator import _step_drive_upload
+    import ugc_pipeline.steps.drive_upload as _du_mod
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir(parents=True, exist_ok=True)
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    product_id = "drive_enabled_product"
+    spec = _video_spec(product_id, spec_index=0, clip_count=2)
+    brief = _product_brief(product_id, tmp_path)
+
+    video_state = VideoState(
+        video_id=spec.video_id,
+        product_id=product_id,
+        spec_index=0,
+    )
+    run_state = _run_state()
+
+    save_video_state(video_state, root=state_root)
+    save_run_state(run_state, root=state_root)
+
+    nb_client = _make_mock_nano_banana(_FAKE_PNG)
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+    ctx.cfg["drive_upload"] = {"enabled": True}
+
+    # Patch run_drive_upload at module level so the local import inside
+    # _step_drive_upload picks up the mock without needing real artifacts.
+    mock_upload = AsyncMock()
+    original = _du_mod.run_drive_upload
+    _du_mod.run_drive_upload = mock_upload
+    try:
+        await _step_drive_upload(video_state, spec, brief, run_state, ctx)
+    finally:
+        _du_mod.run_drive_upload = original
+
+    # status must NOT be completed_local (the early-return path was not taken)
+    assert video_state.status != "completed_local", (
+        "drive_upload.enabled=True should not set status to completed_local"
+    )
+    # The underlying upload function must have been called
+    mock_upload.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_video_preserves_completed_local_status(
+    tmp_path: pathlib.Path,
+    clip_fixture_mp4_path: pathlib.Path,
+    firstframe_fixture_png_path: pathlib.Path,
+) -> None:
+    """process_video must not overwrite completed_local with completed at the end."""
+    from ugc_pipeline.state_manager import load_video_state
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir()
+    artifacts_root.mkdir()
+
+    png_bytes = firstframe_fixture_png_path.read_bytes()
+    mp4_bytes = clip_fixture_mp4_path.read_bytes()
+
+    product_id = "preserve_local_product"
+    brief = _product_brief(product_id, tmp_path)
+    spec = _video_spec(product_id, spec_index=0, clip_count=2)
+
+    save_product_brief(brief, root=state_root)
+    save_video_spec(spec, root=state_root)
+
+    initial_state = VideoState(
+        video_id=spec.video_id,
+        product_id=product_id,
+        spec_index=0,
+    )
+    save_video_state(initial_state, root=state_root)
+
+    run_state = _run_state()
+    save_run_state(run_state, root=state_root)
+
+    nb_client = _make_mock_nano_banana(png_bytes)
+    veo_client = _make_mock_veo(mp4_bytes)
+    flash_client = _make_mock_flash()
+
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+    # Disable drive upload — this causes _step_drive_upload to set completed_local
+    ctx.cfg["drive_upload"] = {"enabled": False}
+
+    with patch("ugc_pipeline.steps.caption.transcribe_with_whisper", return_value=[]):
+        await process_video(spec.video_id, brief, ctx, run_state)
+
+    final_state = load_video_state(spec.video_id, state_root)
+    assert final_state.status == "completed_local", (
+        f"Expected status 'completed_local' to be preserved, got {final_state.status!r}"
+    )

@@ -439,7 +439,14 @@ async def _step_stitch(
 
     from ugc_pipeline.steps.stitch import cleanup_after_step, run_stitch
 
-    await run_stitch(video_state, artifacts_root=ctx.artifacts_root)
+    transition_seconds = float(
+        ctx.cfg.get("post_production", {}).get("transition_seconds", 0.0)
+    )
+    await run_stitch(
+        video_state,
+        artifacts_root=ctx.artifacts_root,
+        transition_seconds=transition_seconds,
+    )
     cleanup_after_step(video_state, "stitch", ctx.cfg.get("cleanup", {}))
 
 
@@ -499,6 +506,20 @@ async def _step_drive_upload(
     ctx: OrchestratorContext,
 ) -> None:
     """Run drive_upload for the video."""
+    drive_cfg = ctx.cfg.get("drive_upload", {}) or {}
+    if not bool(drive_cfg.get("enabled", True)):
+        log.info(
+            "step_skipped_disabled",
+            step="drive_upload",
+            video_id=video_state.video_id,
+            reason="drive_upload.enabled is false",
+        )
+        # Mark the video as completed-local so downstream tooling can distinguish.
+        video_state.status = "completed_local"
+        video_state.updated_at = datetime.now(timezone.utc)
+        save_video_state(video_state, root=ctx.state_root)
+        return
+
     if ctx.dry_run:
         _dry_run_skip("drive_upload", video_state)
         return
@@ -627,8 +648,9 @@ async def process_video(
             ctx.kill_switch_event.set()
             raise KillSwitchFiredError("Kill-switch fired after step completion.")
 
-    # All steps done
-    state.status = "completed"
+    # All steps done — preserve completed_local if a step set it (e.g. drive_upload disabled)
+    if state.status != "completed_local":
+        state.status = "completed"
     state.current_step = None
     state.updated_at = datetime.now(timezone.utc)
     save_video_state(state, root=state_root)
