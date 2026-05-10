@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from ugc_pipeline.models import ProductBrief, RunState, VideoSpec, VideoState
+from ugc_pipeline.prompts.first_frame import REFERENCE_PREAMBLE
 from ugc_pipeline.steps.first_frame import (
     NanoBananaGenerationError,
     NanoBananaResult,
@@ -65,7 +66,7 @@ def _make_spec(clip_count: int = 2, **overrides: object) -> VideoSpec:
         "talent_id": "talent_01",
         "clip_count": clip_count,
         "scene_descriptions": [f"Scene {i} description." for i in range(clip_count)],
-        "script_blocks": [f"Testo italiano per clip {i}." for i in range(clip_count)],
+        "script_blocks": ["" if i != 1 else f"Testo italiano per clip {i}." for i in range(clip_count)],
         "visual_style_notes": "Warm amber tone grading.",
         "created_at": datetime.now(timezone.utc),
     }
@@ -136,7 +137,7 @@ async def test_happy_path(tmp_path: pathlib.Path) -> None:
 
     # Artifacts dict must be updated
     assert "clip_0_firstframe" in video_state.artifacts
-    assert video_state.artifacts["clip_0_firstframe"] == str(out_path)
+    assert video_state.artifacts["clip_0_firstframe"] == str(out_path.resolve())
 
     # Cost must be tracked
     expected_cost = estimate_first_frame_cost_usd()
@@ -281,7 +282,7 @@ async def test_safety_retry_success(tmp_path: pathlib.Path) -> None:
 
     # File written and artifact recorded
     assert out_path.exists()
-    assert video_state.artifacts["clip_0_firstframe"] == str(out_path)
+    assert video_state.artifacts["clip_0_firstframe"] == str(out_path.resolve())
 
     # Cost billed once: bill-after-success protocol means the failed first
     # attempt does not bill; only the successful softened-prompt retry does.
@@ -373,7 +374,7 @@ async def test_generation_error_transient_retry(tmp_path: pathlib.Path) -> None:
 
     # File written successfully on third attempt
     assert out_path.exists()
-    assert video_state.artifacts["clip_0_firstframe"] == str(out_path)
+    assert video_state.artifacts["clip_0_firstframe"] == str(out_path.resolve())
 
     # Cost billed only once: bill-after-success protocol — the two failed
     # NanoBananaGenerationError attempts produce no compute and are not billed;
@@ -417,3 +418,179 @@ async def test_run_first_frames_all_clips(tmp_path: pathlib.Path) -> None:
     # All artifacts recorded
     for i in range(clip_count):
         assert f"clip_{i}_firstframe" in video_state.artifacts
+
+
+# ---------------------------------------------------------------------------
+# Reference-image tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_first_frame_for_clip_passes_reference_bytes(tmp_path: pathlib.Path) -> None:
+    """When reference_image_bytes is supplied, generate_image is called with it."""
+    spec = _make_spec(clip_count=2)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+    client = _make_mock_client()
+
+    ref_bytes = b"\x89PNG\r\n\x1a\nFAKE"
+
+    await run_first_frame_for_clip(
+        spec=spec,
+        brief=brief,
+        clip_index=1,
+        talent_descriptor="woman, late 20s, relaxed aesthetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+        reference_image_bytes=ref_bytes,
+    )
+
+    client.generate_image.assert_awaited_once()
+    call_kwargs = client.generate_image.await_args.kwargs
+    assert call_kwargs["reference_image_bytes"] == ref_bytes
+
+
+@pytest.mark.asyncio
+async def test_run_first_frame_for_clip_no_reference_keeps_text_only(tmp_path: pathlib.Path) -> None:
+    """When reference_image_bytes is not supplied, generate_image is called with None."""
+    spec = _make_spec(clip_count=2)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+    client = _make_mock_client()
+
+    await run_first_frame_for_clip(
+        spec=spec,
+        brief=brief,
+        clip_index=0,
+        talent_descriptor="woman, late 20s, relaxed aesthetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+    )
+
+    client.generate_image.assert_awaited_once()
+    call_kwargs = client.generate_image.await_args.kwargs
+    assert call_kwargs["reference_image_bytes"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_first_frames_chains_clip0_bytes_to_subsequent_clips(tmp_path: pathlib.Path) -> None:
+    """run_first_frames feeds clip-0 PNG bytes as reference_image_bytes to clips 1+."""
+    clip_count = 3
+    spec = _make_spec(clip_count=clip_count)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+
+    # Each call returns the same _FAKE_PNG; clip-0 bytes will be _FAKE_PNG
+    client = _make_mock_client(png_bytes=_FAKE_PNG)
+
+    await run_first_frames(
+        spec=spec,
+        brief=brief,
+        talent_descriptor="man, early 30s, energetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+    )
+
+    assert client.generate_image.await_count == clip_count
+
+    calls = client.generate_image.await_args_list
+
+    # Clip 0: no reference
+    assert calls[0].kwargs["reference_image_bytes"] is None
+
+    # Clips 1 and 2: reference == _FAKE_PNG (the bytes written by clip 0)
+    assert calls[1].kwargs["reference_image_bytes"] == _FAKE_PNG
+    assert calls[2].kwargs["reference_image_bytes"] == _FAKE_PNG
+
+
+@pytest.mark.asyncio
+async def test_run_first_frames_dry_run_passes_no_reference(tmp_path: pathlib.Path) -> None:
+    """In dry_run, no reference_image_bytes is ever read or passed; no FileNotFoundError."""
+    clip_count = 3
+    spec = _make_spec(clip_count=clip_count)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+    client = _make_mock_client()
+
+    # Must not raise FileNotFoundError (path.read_bytes() skipped in dry_run)
+    paths = await run_first_frames(
+        spec=spec,
+        brief=brief,
+        talent_descriptor="man, early 30s, energetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+        dry_run=True,
+    )
+
+    # dry_run skips all API calls
+    client.generate_image.assert_not_awaited()
+
+    # Returns expected paths (non-existent in dry_run)
+    assert len(paths) == clip_count
+    for path in paths:
+        assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_safety_retry_keeps_reference_image(tmp_path: pathlib.Path) -> None:
+    """Safety retry keeps the reference image; only the text prompt is softened.
+
+    The softened retry prompt must include the REFERENCE_PREAMBLE (since the
+    reference image was provided), confirming render_with_reference_softened was used.
+    """
+    spec = _make_spec(clip_count=2)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+
+    ref_bytes = b"FAKE_PNG_REF"
+
+    client = MagicMock()
+    client.generate_image = AsyncMock(
+        side_effect=[
+            NanoBananaSafetyError("safety block"),
+            NanoBananaResult(png_bytes=_FAKE_PNG, model="gemini-3-flash-image"),
+        ]
+    )
+
+    await run_first_frame_for_clip(
+        spec=spec,
+        brief=brief,
+        clip_index=1,
+        talent_descriptor="woman, late 20s, relaxed aesthetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+        reference_image_bytes=ref_bytes,
+    )
+
+    assert client.generate_image.await_count == 2
+
+    retry_kwargs = client.generate_image.await_args_list[1].kwargs
+
+    # Reference image preserved on retry
+    assert retry_kwargs["reference_image_bytes"] == ref_bytes
+
+    # Text prompt is the softened+reference variant — contains REFERENCE_PREAMBLE
+    retry_prompt = retry_kwargs["prompt"]
+    assert REFERENCE_PREAMBLE in retry_prompt, (
+        f"Expected REFERENCE_PREAMBLE in softened retry prompt; got: {retry_prompt[:200]!r}"
+    )

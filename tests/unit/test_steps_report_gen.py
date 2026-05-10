@@ -59,7 +59,7 @@ def _make_video_spec(
     if script_blocks is None:
         # Italian content per CLAUDE.md rule
         script_blocks = [
-            "Ogni mattina inizia con un rituale.",
+            "",
             "Questo momento è solo tuo.",
         ]
     return VideoSpec(

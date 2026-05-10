@@ -15,6 +15,7 @@ from ugc_pipeline.utils.ffmpeg import (
     ffmpeg_binary,
     ffprobe_dimensions,
     ffprobe_duration_seconds,
+    ffprobe_has_audio,
     quote_concat_path,
     run_ffmpeg,
 )
@@ -93,6 +94,47 @@ async def test_run_ffmpeg_invalid_input_raises(tmp_path: pathlib.Path) -> None:
     with pytest.raises(FfmpegError) as exc_info:
         await run_ffmpeg(["-i", fake_input, fake_output])
     assert "ffmpeg" in str(exc_info.value).lower() or "error" in str(exc_info.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# quote_concat_path
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ffprobe_has_audio
+# ---------------------------------------------------------------------------
+
+
+def test_ffprobe_has_audio_silent_clip(clip_fixture_mp4_path: pathlib.Path) -> None:
+    """The silent fixture clip must return False."""
+    assert ffprobe_has_audio(clip_fixture_mp4_path) is False
+
+
+@pytest.mark.asyncio
+async def test_ffprobe_has_audio_clip_with_audio(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A clip with a synthetic silent AAC track should return True."""
+    out = tmp_path / "clip_with_audio.mp4"
+    await run_ffmpeg([
+        "-y",
+        "-i", str(clip_fixture_mp4_path),
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-shortest",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        str(out),
+    ])
+    assert ffprobe_has_audio(out) is True
+
+
+def test_ffprobe_has_audio_nonexistent_raises() -> None:
+    """ffprobe_has_audio should raise FfmpegError for a missing file."""
+    with pytest.raises(FfmpegError):
+        ffprobe_has_audio(pathlib.Path("/nonexistent/clip.mp4"))
 
 
 # ---------------------------------------------------------------------------

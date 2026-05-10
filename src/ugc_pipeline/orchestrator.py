@@ -201,7 +201,19 @@ async def _step_first_frame(
     run_state: RunState,
     ctx: OrchestratorContext,
 ) -> None:
-    """Run first_frame_composite for all clips in the video (parallel)."""
+    """Run first_frame_composite for all clips in the video.
+
+    Clip 0 runs first (serial gatekeeper); clips 1..N run in parallel anchored
+    on clip 0's PNG bytes as a visual reference. This keeps talent/lighting
+    consistent across clips within a video.
+
+    Edge cases handled:
+    - Clip 0 absent from admitted batch (completed in a prior run): load its
+      bytes from disk for the chain without re-generating.
+    - dry_run: file does not exist on disk; skip read_bytes() for all clips.
+    - Empty admitted batch: return immediately.
+    - Single admitted clip (only clip 0): run it alone, no chaining.
+    """
     from ugc_pipeline.steps.first_frame import run_first_frame_for_clip
     from ugc_pipeline.utils.config import get_talent_descriptor
 
@@ -212,29 +224,76 @@ async def _step_first_frame(
     # Budget admission (per SPEC.md §8)
     clip_indices = admit_clip_batch(video_state, clip_indices, run_state, cfg.get("budget", cfg))
 
+    if not clip_indices:
+        return
+
     talent_descriptor = get_talent_descriptor(spec.talent_id, ctx.talent_pool)
     client = ctx.effective_nano_banana_client()
     nb_cfg = cfg.get("nano_banana", {})
     nb_model = str(nb_cfg.get("model", "gemini-2.5-flash-image"))
     nb_size_hint = nb_cfg.get("product_size_hint") or None  # None -> prompt default
 
+    common_kwargs: dict = dict(
+        spec=spec,
+        brief=brief,
+        talent_descriptor=talent_descriptor,
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=ctx.state_root,
+        artifacts_root=ctx.artifacts_root,
+        global_max_usd=global_max,
+        dry_run=ctx.dry_run,
+        model=nb_model,
+        product_size_hint=nb_size_hint,
+    )
+
+    # ------------------------------------------------------------------
+    # Resolve clip 0's reference bytes (the visual anchor for clips 1..N)
+    # ------------------------------------------------------------------
+    clip0_bytes: bytes | None = None
+    indices_to_run_in_parallel = list(clip_indices)
+
+    if 0 in clip_indices:
+        # Run clip 0 first as the serial gatekeeper
+        clip0_path = await run_first_frame_for_clip(
+            clip_index=0, reference_image_bytes=None, **common_kwargs
+        )
+        indices_to_run_in_parallel.remove(0)
+        # In dry_run, clip0_path does not exist on disk — skip read_bytes()
+        if not ctx.dry_run:
+            clip0_bytes = clip0_path.read_bytes()
+    elif any(i >= 1 for i in clip_indices):
+        # Clip 0 was completed in a prior run; load its bytes from disk for the chain.
+        clip0_path_str = video_state.artifacts.get("clip_0_firstframe")
+        if clip0_path_str and not ctx.dry_run:
+            clip0_path = pathlib.Path(clip0_path_str)
+            if clip0_path.exists() and clip0_path.stat().st_size > 0:
+                clip0_bytes = clip0_path.read_bytes()
+            else:
+                log.warning(
+                    "first_frame_chain_degraded",
+                    reason="clip_0_artifact_missing_or_empty",
+                    clip_0_path=clip0_path_str,
+                    video_id=video_state.video_id,
+                )
+
+    if not indices_to_run_in_parallel:
+        return
+
+    log.info(
+        "first_frame_chain_active",
+        clip_count=len(indices_to_run_in_parallel),
+        reference_source="clip_0",
+        reference_available=clip0_bytes is not None,
+        video_id=video_state.video_id,
+    )
+
     tasks = [
         run_first_frame_for_clip(
-            spec,
-            brief,
-            i,
-            talent_descriptor,
-            client=client,
-            video_state=video_state,
-            run_state=run_state,
-            state_root=ctx.state_root,
-            artifacts_root=ctx.artifacts_root,
-            global_max_usd=global_max,
-            dry_run=ctx.dry_run,
-            model=nb_model,
-            product_size_hint=nb_size_hint,
+            clip_index=i, reference_image_bytes=clip0_bytes, **common_kwargs
         )
-        for i in clip_indices
+        for i in indices_to_run_in_parallel
     ]
     await asyncio.gather(*tasks)
 
@@ -579,6 +638,30 @@ async def process_product(
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight config validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_creative_director_config(cfg: dict) -> None:
+    """Validate creative_director config values before any Gemini call.
+
+    Raises ``ValueError`` on bad config so that a nonsense ``speaking_clip_index``
+    is caught immediately at startup rather than after an expensive LLM call.
+    """
+    cd_cfg = cfg.get("creative_director", {})
+    speaking_idx = int(cd_cfg.get("speaking_clip_index", 1))
+    clip_counts_cfg = cd_cfg.get("clip_counts", (2, 3, 2))
+    clip_counts = tuple(int(c) for c in clip_counts_cfg)
+    for i, cc in enumerate(clip_counts):
+        if not (0 <= speaking_idx < cc):
+            raise ValueError(
+                f"creative_director.speaking_clip_index={speaking_idx} is out of range "
+                f"for clip_counts[{i}]={cc}. Must satisfy 0 <= speaking_clip_index < clip_count "
+                f"for ALL spec configurations."
+            )
+
+
+# ---------------------------------------------------------------------------
 # Top-level pipeline entry point
 # ---------------------------------------------------------------------------
 
@@ -609,6 +692,10 @@ async def run_pipeline(
     from ugc_pipeline.models import VideoState
 
     cfg = ctx.cfg
+
+    # Pre-flight: validate creative_director config before any Gemini call.
+    _validate_creative_director_config(cfg)
+
     parallelism_cfg = cfg.get("parallelism", {})
     max_concurrent = int(parallelism_cfg.get("max_concurrent_products", 2))
     product_semaphore = asyncio.Semaphore(max_concurrent)
@@ -641,6 +728,8 @@ async def run_pipeline(
 
             # Stage 2 — product_analyst
             try:
+                naming_cfg = (ctx.brand_guidance.get("naming", {}) or {}) if ctx.brand_guidance else {}
+                variant_suffix_pattern = naming_cfg.get("filename_variant_suffix_pattern") or None
                 brief = await run_product_analyst(
                     img.image_bytes,
                     img.filename,
@@ -649,6 +738,8 @@ async def run_pipeline(
                     run_state=run_state,
                     state_root=ctx.state_root,
                     global_max_usd=global_max_usd,
+                    brand_name=ctx.brand_guidance.get("brand_name", "") if ctx.brand_guidance else "",
+                    variant_suffix_pattern=variant_suffix_pattern,
                 )
             except Exception as exc:
                 log.error("product_analyst_failed", product_id=img.product_id, error=str(exc))
@@ -657,7 +748,8 @@ async def run_pipeline(
             # Stage 3 — creative_director
             cd_cfg = ctx.cfg.get("creative_director", {})
             clip_counts_cfg = cd_cfg.get("clip_counts")
-            cd_kwargs: dict = {}
+            speaking_idx_cfg = int(cd_cfg.get("speaking_clip_index", 1))
+            cd_kwargs: dict = {"speaking_clip_index": speaking_idx_cfg}
             if clip_counts_cfg:
                 cd_kwargs["clip_counts"] = tuple(int(c) for c in clip_counts_cfg)
             try:

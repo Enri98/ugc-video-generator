@@ -13,6 +13,7 @@ with a non-zero size, the ffmpeg call is skipped.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ from pathlib import Path
 import structlog
 
 from ugc_pipeline.models import VideoState
-from ugc_pipeline.utils.ffmpeg import FfmpegError, quote_concat_path, run_ffmpeg
+from ugc_pipeline.utils.ffmpeg import FfmpegError, ffprobe_has_audio, quote_concat_path, run_ffmpeg
 
 log = structlog.get_logger(__name__)
 
@@ -28,6 +29,94 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _normalise_audio_streams(
+    clip_paths: list[Path],
+    video_dir: Path,
+    *,
+    video_state: VideoState,
+    clip_indices: list[int],
+) -> list[Path]:
+    """Ensure all clips share the same audio-stream presence.
+
+    Probes each clip. If all clips lack audio, returns the input list unchanged.
+    If all clips have audio, returns the input list unchanged.
+    If mixed: re-muxes each silent clip with a silent AAC audio track of matching
+    duration, writing to ``video_dir/<original_stem>_silenced.mp4``. Returns
+    a new list of paths (silenced clips swapped in for silent originals).
+    Existing audio-bearing clips are passed through unchanged.
+
+    Each silenced intermediate is registered in ``video_state.artifacts`` under
+    the key ``clip_{i}_silenced`` so that :func:`cleanup_after_step` can delete
+    it later.
+
+    Parameters
+    ----------
+    clip_paths:
+        Ordered list of trimmed clip paths.
+    video_dir:
+        Directory where silenced variants are written.
+    video_state:
+        Mutable VideoState; silenced artifact keys are registered inline.
+    clip_indices:
+        Clip indices in the same order as *clip_paths* (used to build the
+        ``clip_{i}_silenced`` artifact key).
+
+    Returns
+    -------
+    list[Path]
+        Normalised list — same order as input.
+    """
+    has_audio_flags = [ffprobe_has_audio(p) for p in clip_paths]
+    all_have_audio = all(has_audio_flags)
+    none_have_audio = not any(has_audio_flags)
+
+    if all_have_audio:
+        log.info("stitch_audio_homogeneous", variant="all_have_audio", clip_count=len(clip_paths))
+        return clip_paths
+
+    if none_have_audio:
+        log.info("stitch_audio_homogeneous", variant="none_have_audio", clip_count=len(clip_paths))
+        return clip_paths
+
+    # Mixed: add silent audio track to clips that lack one
+    audio_clip_count = sum(has_audio_flags)
+    silent_clip_count = len(clip_paths) - audio_clip_count
+    log.warning(
+        "stitch_audio_heterogeneous_normalised",
+        silent_clip_count=silent_clip_count,
+        audio_clip_count=audio_clip_count,
+    )
+
+    async def _silence_one(clip: Path, clip_index: int) -> Path:
+        stem = clip.stem
+        out = video_dir / f"{stem}_silenced.mp4"
+        await run_ffmpeg([
+            "-y",
+            "-i", str(clip),
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-shortest",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            str(out),
+        ])
+        video_state.artifacts[f"clip_{clip_index}_silenced"] = str(out.resolve())
+        return out
+
+    async def _maybe_silence(clip: Path, clip_index: int, needs_silence: bool) -> Path:
+        if needs_silence:
+            return await _silence_one(clip, clip_index)
+        return clip
+
+    results: list[Path] = await asyncio.gather(
+        *[
+            _maybe_silence(clip, clip_index, not has_audio)
+            for clip, clip_index, has_audio in zip(clip_paths, clip_indices, has_audio_flags)
+        ]
+    )
+    return list(results)
 
 
 def _trimmed_clip_indices(video_state: VideoState) -> list[int]:
@@ -92,6 +181,20 @@ def cleanup_after_step(
 
     if not keep_trimmed:
         for key in [k for k in list(video_state.artifacts) if k.endswith("_trimmed")]:
+            file_path = Path(video_state.artifacts[key])
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+            except OSError as exc:
+                log.warning(
+                    "cleanup_delete_failed",
+                    artifact_key=key,
+                    path=str(file_path),
+                    error=str(exc),
+                )
+            video_state.artifacts.pop(key, None)
+
+        for key in [k for k in list(video_state.artifacts) if k.endswith("_silenced")]:
             file_path = Path(video_state.artifacts[key])
             try:
                 if file_path.exists():
@@ -182,10 +285,17 @@ async def run_stitch(
     ]
 
     # ------------------------------------------------------------------
-    # Write concat list
+    # Normalise audio streams (handles mixed audio/no-audio clips)
     # ------------------------------------------------------------------
     video_dir = artifacts_root / video_state.video_id
     video_dir.mkdir(parents=True, exist_ok=True)
+    clip_paths = await _normalise_audio_streams(
+        clip_paths, video_dir, video_state=video_state, clip_indices=indices
+    )
+
+    # ------------------------------------------------------------------
+    # Write concat list
+    # ------------------------------------------------------------------
     concat_list = video_dir / "concat_list.txt"
 
     # ffmpeg's concat demuxer resolves relative entries against the concat
@@ -211,7 +321,7 @@ async def run_stitch(
     # ------------------------------------------------------------------
     # Update artifacts
     # ------------------------------------------------------------------
-    video_state.artifacts["stitched"] = str(out_path)
+    video_state.artifacts["stitched"] = str(out_path.resolve())
 
     # ------------------------------------------------------------------
     # Cleanup (per SPEC.md §7 cleanup_after_step)

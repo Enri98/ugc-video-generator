@@ -197,6 +197,7 @@ def cli_entry(argv: list[str] | None = None) -> None:
             resolution=str(veo_cfg.get("resolution", "720p")),
             duration_seconds=int(veo_cfg.get("duration_seconds", 8)),
             person_generation=str(veo_cfg.get("person_generation", "allow_adult")),
+            generate_audio=bool(veo_cfg.get("generate_audio", True)),
         )
         log.info(
             "veo_client_initialised",

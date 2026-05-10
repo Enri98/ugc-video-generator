@@ -5,6 +5,15 @@
 #
 # All fields are optional; an empty file is equivalent to "no extra guidance".
 
+# Brand identity — used for product-name derivation from image filenames.
+brand_name: "Acme"
+
+# Optional: regex applied to filenames to strip a trailing variant marker
+# before deriving product_name. Empty / absent = no suffix stripping.
+# Example: "[-_ ]v\\d+$" matches "-v1", "_v2", " v3" suffixes.
+naming:
+  filename_variant_suffix_pattern: "[-_ ]v\\d+$"
+
 # Free-form positioning paragraph the director will treat as authoritative
 # context for what the product is and how it should be framed in the video.
 positioning: |

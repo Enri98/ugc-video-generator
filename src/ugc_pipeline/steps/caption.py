@@ -350,7 +350,7 @@ async def run_caption(
     )
     ass_path = video_dir / "captions.ass"
     ass_path.write_text(ass_text, encoding="utf-8")
-    video_state.artifacts["captions_ass"] = str(ass_path)
+    video_state.artifacts["captions_ass"] = str(ass_path.resolve())
 
     # ------------------------------------------------------------------
     # Burn subtitles into video with ffmpeg
@@ -371,7 +371,7 @@ async def run_caption(
     # ------------------------------------------------------------------
     # Update artifacts and log completion
     # ------------------------------------------------------------------
-    video_state.artifacts["final"] = str(out_path)
+    video_state.artifacts["final"] = str(out_path.resolve())
 
     duration_ms = int((time.monotonic() - t_start) * 1000)
     log.info(

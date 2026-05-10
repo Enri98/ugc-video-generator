@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import pydantic
 import structlog
 import tenacity
 
@@ -93,7 +94,7 @@ def _make_api_caller(client: Any, model: str, contents: list[Any], config: Any) 
     """Return an awaitable for the Gemini text API call, wrapped in tenacity retries."""
 
     @tenacity.retry(
-        stop=tenacity.stop_after_attempt(5),
+        stop=tenacity.stop_after_attempt(3),
         wait=tenacity.wait_exponential(multiplier=2, max=60),
         retry=tenacity.retry_if_exception_type(Exception),
         reraise=True,
@@ -106,6 +107,58 @@ def _make_api_caller(client: Any, model: str, contents: list[Any], config: Any) 
         )
 
     return _call()
+
+
+# ---------------------------------------------------------------------------
+# Corrective-retry prompt builder
+# ---------------------------------------------------------------------------
+
+
+def _render_corrective_prompt(
+    original_prompt: str,
+    validation_error_msg: str,
+    rejected_script_blocks: list[str],
+    speaking_clip_index: int,
+) -> str:
+    """Build a corrective follow-up prompt when the first response fails VideoSpec validation.
+
+    Parameters
+    ----------
+    original_prompt:
+        The full rendered director prompt that was sent in the first call.
+    validation_error_msg:
+        The string representation of the pydantic ValidationError.
+    rejected_script_blocks:
+        The script_blocks list extracted from the rejected response, or [] if JSON
+        parsing failed entirely.
+    speaking_clip_index:
+        The 0-based index of the single clip that is allowed to have spoken dialogue.
+    """
+    if rejected_script_blocks:
+        blocks_repr = "\n".join(
+            f"  [{i}]: {repr(block)}" for i, block in enumerate(rejected_script_blocks)
+        )
+        blocks_section = (
+            f"Your previous (rejected) script_blocks were:\n{blocks_repr}\n"
+        )
+    else:
+        blocks_section = (
+            "Your previous response could not be parsed as JSON, so the individual "
+            "script_blocks entries could not be extracted.\n"
+        )
+
+    correction_section = (
+        "\n\n--- CORRECTION REQUIRED ---\n"
+        "Your previous response was REJECTED by the schema validator.\n"
+        f"The error was: {validation_error_msg}\n\n"
+        "The most common mistake is putting spoken text in MORE THAN ONE script_blocks "
+        f"entry — only script_blocks[{speaking_clip_index}] may contain Italian voice; "
+        "all others MUST be the literal string '[silent]'.\n"
+        f"{blocks_section}"
+        "Re-emit a corrected VideoSpec JSON now."
+    )
+
+    return original_prompt + correction_section
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +176,7 @@ async def run_creative_director(
     global_max_usd: float = 50.0,
     clip_counts: tuple[int, ...] = (2, 3, 2),
     brand_guidance: dict | None = None,
+    speaking_clip_index: int = 1,
 ) -> list[VideoSpec]:
     """Run the creative director step and return three VideoSpec objects.
 
@@ -145,6 +199,9 @@ async def run_creative_director(
         Kill-switch threshold forwarded to increment_cost.
     clip_counts:
         Number of clips for each of the three specs respectively.
+    speaking_clip_index:
+        0-based index of the single clip that carries spoken Italian voiceover.
+        Passed through to director_prompt.render() and used for corrective retries.
     """
     import time
 
@@ -186,6 +243,8 @@ async def run_creative_director(
             clip_count=clip_count,
             lifestyle_context=lifestyle_context,
             brand_guidance=brand_guidance,
+            speaking_clip_index=speaking_clip_index,
+            product_name=brief.product_name,
         )
         prompt_version = PromptVersion(
             step_name="creative_director",
@@ -234,11 +293,65 @@ async def run_creative_director(
 
         cost_this_call = refined_cost if refined_cost is not None else _FLAT_ESTIMATE_USD
 
-        # Parse response
+        # Parse and validate response; attempt one corrective retry on ValidationError
+        response_text: str = response.text  # type: ignore[union-attr]
+        corrective_prompt_version: PromptVersion | None = None
         try:
-            response_text: str = response.text  # type: ignore[union-attr]
             spec = VideoSpec.model_validate_json(response_text)
-        except (json.JSONDecodeError, Exception) as exc:
+        except pydantic.ValidationError as val_exc:
+            # Extract rejected script_blocks if JSON is parseable
+            try:
+                rejected_script_blocks: list[str] = json.loads(response_text).get("script_blocks", [])
+            except (json.JSONDecodeError, Exception):
+                rejected_script_blocks = []
+
+            log.warning(
+                "creative_director_validation_failed",
+                product_id=brief.product_id,
+                spec_index=spec_index,
+                error=str(val_exc),
+                response_excerpt=response_text[:500],
+            )
+
+            # Build corrective prompt and submit ONE retry
+            corrective_prompt = _render_corrective_prompt(
+                original_prompt=rendered_prompt,
+                validation_error_msg=str(val_exc),
+                rejected_script_blocks=rejected_script_blocks,
+                speaking_clip_index=speaking_clip_index,
+            )
+            corrective_prompt_version = PromptVersion(
+                step_name="creative_director_corrective",
+                version=director_prompt.VERSION,
+                content_sha256=hashlib.sha256(corrective_prompt.encode()).hexdigest(),
+                rendered_at=datetime.now(timezone.utc),
+            )
+            corrective_contents = [{"role": "user", "parts": [{"text": corrective_prompt}]}]
+
+            # Bill BEFORE awaiting the corrective call (same "bill on submit" rule as above)
+            increment_cost(run_state, None, "creative_director_usd", _FLAT_ESTIMATE_USD, global_max_usd)
+
+            corrective_response = await _make_api_caller(
+                client, "gemini-2.5-pro", corrective_contents, config
+            )
+
+            # Refine cost using actual token counts from the corrective response
+            try:
+                corrective_usage = corrective_response.usage_metadata  # type: ignore[union-attr]
+                corr_in_tok = getattr(corrective_usage, "prompt_token_count", 0) or 0
+                corr_out_tok = getattr(corrective_usage, "candidates_token_count", 0) or 0
+                if corr_in_tok or corr_out_tok:
+                    corr_refined = estimate_creative_director_cost_usd(corr_in_tok, corr_out_tok)
+                    corr_delta = corr_refined - _FLAT_ESTIMATE_USD
+                    if corr_delta != 0.0:
+                        increment_cost(run_state, None, "creative_director_usd", corr_delta, global_max_usd)
+            except Exception:  # noqa: BLE001
+                pass
+
+            corrective_response_text: str = corrective_response.text  # type: ignore[union-attr]
+            # If this also raises ValidationError, propagate — no further retries
+            spec = VideoSpec.model_validate_json(corrective_response_text)
+        except Exception as exc:
             log.error(
                 "step_failed",
                 step="creative_director",
@@ -256,6 +369,7 @@ async def run_creative_director(
                 "spec_index": spec_index,
                 "talent_id": talent_id,
                 "created_at": datetime.now(timezone.utc),
+                "speaking_clip_index": speaking_clip_index,
             }
         )
 
@@ -276,13 +390,18 @@ async def run_creative_director(
         # Persist spec
         save_video_spec(spec, root=state_root)
 
+        # Build prompt_versions dict (include corrective entry if a retry was made)
+        prompt_versions_dict: dict[str, PromptVersion] = {"creative_director": prompt_version}
+        if corrective_prompt_version is not None:
+            prompt_versions_dict["creative_director_corrective"] = corrective_prompt_version
+
         # Initialise a pending VideoState for this spec
         video_state = VideoState(
             video_id=spec.video_id,
             product_id=spec.product_id,
             spec_index=spec.spec_index,
             status="pending",
-            prompt_versions={"creative_director": prompt_version},
+            prompt_versions=prompt_versions_dict,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
         )
@@ -299,7 +418,7 @@ async def run_creative_director(
             duration_ms=duration_ms,
             cost_usd_this_call=cost_this_call,
             cost_usd_cumulative=run_state.cumulative_cost_usd,
-            prompt_versions={"creative_director": prompt_version.model_dump(mode="json")},
+            prompt_versions={k: v.model_dump(mode="json") for k, v in prompt_versions_dict.items()},
         )
 
         specs.append(spec)

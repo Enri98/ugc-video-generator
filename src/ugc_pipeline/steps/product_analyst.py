@@ -14,6 +14,7 @@ import base64
 import hashlib
 import json
 import pathlib
+import re
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -119,6 +120,64 @@ def make_default_client(
 
 
 # ---------------------------------------------------------------------------
+# Product name derivation helper
+# ---------------------------------------------------------------------------
+
+
+def derive_product_name(
+    filename: str,
+    brand_name: str = "",
+    *,
+    variant_suffix_pattern: str | None = None,
+) -> str:
+    """Derive a human-readable product name from an input image filename.
+
+    Steps:
+    1. Strip the file extension.
+    2. If brand_name is non-empty: case-insensitively strip it from the start
+       of the stem, allowing one separator character (-, _, or space) between
+       brand and product.
+    3. If variant_suffix_pattern is supplied (non-empty): apply
+       ``re.sub(variant_suffix_pattern, "", stem, flags=re.IGNORECASE)`` to
+       remove a project-specific trailing variant marker (e.g. a configured
+       regex like ``r"[-_ ]v\\d+$"`` to strip "-v1", "_v2", etc.).
+    4. Replace -/_ with spaces, collapse internal whitespace.
+    5. Title-case the result.
+
+    Returns "" if parsing yields nothing.
+
+    Examples (with brand_name="Acme", variant_suffix_pattern=r"[-_ ]v\\d+$"):
+        "acme-coffee-mug-v2.png"        -> "Coffee Mug"
+        "ACME-ceramic-cup-v1.jpg"       -> "Ceramic Cup"
+        "kitchen-blend.png"             -> "Kitchen Blend"  # no brand to strip
+        "Acme.png"                      -> ""               # only brand, no product
+        "Acme_kitchen_blend_v1.jpg"     -> "Kitchen Blend"  # underscore separators
+    """
+    stem = pathlib.Path(filename).stem
+
+    # Strip brand prefix (case-insensitive) with optional separator
+    if brand_name:
+        pattern = re.compile(
+            r"^" + re.escape(brand_name) + r"[-_ ]?",
+            re.IGNORECASE,
+        )
+        stem = pattern.sub("", stem)
+
+    # Strip trailing variant marker if a pattern is configured
+    if variant_suffix_pattern:
+        stem = re.sub(variant_suffix_pattern, "", stem, flags=re.IGNORECASE)
+
+    # Replace separators with spaces and collapse whitespace
+    stem = re.sub(r"[-_]+", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip()
+
+    if not stem:
+        return ""
+
+    return stem.title()
+
+
+# ---------------------------------------------------------------------------
 # MIME type helper
 # ---------------------------------------------------------------------------
 
@@ -177,6 +236,8 @@ async def run_product_analyst(
     run_state: RunState,
     state_root: pathlib.Path,
     global_max_usd: float = 50.0,
+    brand_name: str = "",
+    variant_suffix_pattern: str | None = None,
 ) -> ProductBrief:
     """Run the product analyst step and return a ProductBrief.
 
@@ -307,6 +368,7 @@ async def run_product_analyst(
         update={
             "product_id": product_id,
             "image_path": str(image_path),
+            "product_name": derive_product_name(filename, brand_name, variant_suffix_pattern=variant_suffix_pattern),
             "created_at": datetime.now(timezone.utc),
         }
     )

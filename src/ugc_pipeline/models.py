@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -95,6 +95,7 @@ class ProductBrief(BaseModel):
 
     product_id: str
     image_path: str
+    product_name: str = ""  # Derived from filename by orchestrator; LLM must NOT invent.
     shape: str
     dominant_colours: list[str]
     packaging_style: str
@@ -130,9 +131,56 @@ class VideoSpec(BaseModel):
     scene_descriptions: list[str]
     script_blocks: list[str]
     visual_style_notes: str | None = None
+    # 0-based index of the clip that carries the spoken Italian script; all
+    # other clips are silent / ambient.
+    speaking_clip_index: int = 1
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+
+    @model_validator(mode="after")
+    def _validate_clip_consistency(self) -> "VideoSpec":
+        """Enforce structural consistency across clip-related fields."""
+        # 1. scene_descriptions length must match clip_count
+        if len(self.scene_descriptions) != self.clip_count:
+            raise ValueError(
+                f"scene_descriptions has {len(self.scene_descriptions)} entries "
+                f"but clip_count is {self.clip_count}."
+            )
+        # 2. script_blocks length must match clip_count
+        if len(self.script_blocks) != self.clip_count:
+            raise ValueError(
+                f"script_blocks has {len(self.script_blocks)} entries "
+                f"but clip_count is {self.clip_count}."
+            )
+        # 3. speaking_clip_index must be a valid index
+        if not (0 <= self.speaking_clip_index < self.clip_count):
+            raise ValueError(
+                f"speaking_clip_index {self.speaking_clip_index} is out of range "
+                f"for clip_count {self.clip_count} (must be 0 <= index < clip_count)."
+            )
+        # 4. Exactly one script_block must be non-silent; it must be at speaking_clip_index.
+        def _is_silent(text: str) -> bool:
+            return text.strip() == "" or text.strip() == "[silent]"
+
+        non_silent_indices = [
+            i for i, block in enumerate(self.script_blocks) if not _is_silent(block)
+        ]
+        if len(non_silent_indices) == 0:
+            raise ValueError(
+                "All script_blocks are silent/empty. Exactly one must contain spoken text."
+            )
+        if len(non_silent_indices) > 1:
+            raise ValueError(
+                f"Multiple script_blocks contain spoken text (indices {non_silent_indices}). "
+                f"Exactly one must be non-silent."
+            )
+        if non_silent_indices[0] != self.speaking_clip_index:
+            raise ValueError(
+                f"The non-silent script_block is at index {non_silent_indices[0]} "
+                f"but speaking_clip_index is {self.speaking_clip_index}. They must match."
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------

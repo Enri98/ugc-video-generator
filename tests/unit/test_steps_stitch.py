@@ -13,8 +13,8 @@ import uuid
 import pytest
 
 from ugc_pipeline.models import CostBreakdown, VideoState
-from ugc_pipeline.steps.stitch import cleanup_after_step, run_stitch
-from ugc_pipeline.utils.ffmpeg import ffprobe_duration_seconds
+from ugc_pipeline.steps.stitch import _normalise_audio_streams, cleanup_after_step, run_stitch
+from ugc_pipeline.utils.ffmpeg import ffprobe_duration_seconds, ffprobe_has_audio, run_ffmpeg
 
 
 # ---------------------------------------------------------------------------
@@ -255,3 +255,311 @@ def test_cleanup_after_step_noop_for_other_steps(tmp_path: pathlib.Path) -> None
 
     assert "clip_0_raw" in video_state.artifacts
     assert dummy.exists()
+
+
+# ---------------------------------------------------------------------------
+# Audio normalisation helpers
+# ---------------------------------------------------------------------------
+
+
+async def _add_silent_audio_track(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """Add a synthetic silent AAC audio track to a video clip using ffmpeg."""
+    await run_ffmpeg([
+        "-y",
+        "-i", str(src),
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-shortest",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        str(dst),
+    ])
+
+
+# ---------------------------------------------------------------------------
+# _normalise_audio_streams — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_normalise_returns_input_unchanged_when_homogeneous_silent(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two silent clips → input list returned as-is, no _silenced files."""
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    clip0 = video_dir / "clip_0_trimmed.mp4"
+    clip1 = video_dir / "clip_1_trimmed.mp4"
+    shutil.copy2(clip_fixture_mp4_path, clip0)
+    shutil.copy2(clip_fixture_mp4_path, clip1)
+
+    video_state = _make_video_state()
+    result = await _normalise_audio_streams(
+        [clip0, clip1], video_dir, video_state=video_state, clip_indices=[0, 1]
+    )
+
+    assert result == [clip0, clip1]
+    assert not any(video_dir.glob("*_silenced.mp4"))
+    assert not any(k.endswith("_silenced") for k in video_state.artifacts)
+
+
+@pytest.mark.asyncio
+async def test_normalise_returns_input_unchanged_when_homogeneous_audio(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two clips that both have audio → input list returned as-is, no _silenced files."""
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    clip0 = video_dir / "clip_0_trimmed.mp4"
+    clip1 = video_dir / "clip_1_trimmed.mp4"
+    await _add_silent_audio_track(clip_fixture_mp4_path, clip0)
+    await _add_silent_audio_track(clip_fixture_mp4_path, clip1)
+
+    video_state = _make_video_state()
+    result = await _normalise_audio_streams(
+        [clip0, clip1], video_dir, video_state=video_state, clip_indices=[0, 1]
+    )
+
+    assert result == [clip0, clip1]
+    assert not any(video_dir.glob("*_silenced.mp4"))
+    assert not any(k.endswith("_silenced") for k in video_state.artifacts)
+
+
+@pytest.mark.asyncio
+async def test_normalise_swaps_in_silenced_paths_when_mixed(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """One clip with audio + one without → silenced variant created, swapped in, and registered."""
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    clip_with_audio = video_dir / "clip_0_trimmed.mp4"
+    clip_silent = video_dir / "clip_1_trimmed.mp4"
+    await _add_silent_audio_track(clip_fixture_mp4_path, clip_with_audio)
+    shutil.copy2(clip_fixture_mp4_path, clip_silent)
+
+    video_state = _make_video_state()
+    result = await _normalise_audio_streams(
+        [clip_with_audio, clip_silent], video_dir, video_state=video_state, clip_indices=[0, 1]
+    )
+
+    # First clip (had audio) unchanged
+    assert result[0] == clip_with_audio
+    # Second clip (was silent) swapped for _silenced variant
+    assert result[1] != clip_silent
+    assert "_silenced" in result[1].name
+    assert result[1].exists()
+    assert ffprobe_has_audio(result[1]) is True
+    # Artifact registered for the silenced clip (index 1)
+    assert "clip_1_silenced" in video_state.artifacts
+    silenced_path = pathlib.Path(video_state.artifacts["clip_1_silenced"])
+    assert silenced_path.exists()
+    # No artifact for the clip that already had audio (index 0)
+    assert "clip_0_silenced" not in video_state.artifacts
+
+
+# ---------------------------------------------------------------------------
+# Audio normalisation — via run_stitch integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_normalise_skipped_when_all_silent(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """All-silent clips: run_stitch succeeds, no _silenced files created."""
+    video_state = _make_video_state()
+    _setup_two_trimmed_clips(clip_fixture_mp4_path, tmp_path, video_state)
+
+    out_path = await run_stitch(
+        video_state,
+        artifacts_root=tmp_path,
+        cleanup_raw=False,
+        cleanup_trimmed=False,
+    )
+
+    assert out_path.exists()
+    assert ffprobe_has_audio(out_path) is False
+    video_dir = tmp_path / video_state.video_id
+    assert not any(video_dir.glob("*_silenced.mp4"))
+
+
+@pytest.mark.asyncio
+async def test_normalise_skipped_when_all_have_audio(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """All-audio clips: run_stitch succeeds, no _silenced files, output has audio."""
+    video_state = _make_video_state()
+    video_dir = tmp_path / video_state.video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(2):
+        dst = video_dir / f"clip_{i}_trimmed.mp4"
+        await _add_silent_audio_track(clip_fixture_mp4_path, dst)
+        video_state.artifacts[f"clip_{i}_trimmed"] = str(dst)
+
+    out_path = await run_stitch(
+        video_state,
+        artifacts_root=tmp_path,
+        cleanup_raw=False,
+        cleanup_trimmed=False,
+    )
+
+    assert out_path.exists()
+    assert ffprobe_has_audio(out_path) is True
+    assert not any(video_dir.glob("*_silenced.mp4"))
+
+
+@pytest.mark.asyncio
+async def test_normalise_adds_silent_track_when_mixed(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Mixed audio clips: _silenced file created, stitched output has audio."""
+    video_state = _make_video_state()
+    video_dir = tmp_path / video_state.video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    # clip_0: has audio; clip_1: silent
+    clip0 = video_dir / "clip_0_trimmed.mp4"
+    clip1 = video_dir / "clip_1_trimmed.mp4"
+    await _add_silent_audio_track(clip_fixture_mp4_path, clip0)
+    shutil.copy2(clip_fixture_mp4_path, clip1)
+    video_state.artifacts["clip_0_trimmed"] = str(clip0)
+    video_state.artifacts["clip_1_trimmed"] = str(clip1)
+
+    out_path = await run_stitch(
+        video_state,
+        artifacts_root=tmp_path,
+        cleanup_raw=False,
+        cleanup_trimmed=False,
+    )
+
+    assert out_path.exists()
+    assert ffprobe_has_audio(out_path) is True
+    silenced = list(video_dir.glob("*_silenced.mp4"))
+    assert len(silenced) == 1, f"Expected 1 _silenced.mp4, found: {silenced}"
+
+    # The silenced intermediate must be registered in artifacts (clip_1 was the silent one)
+    assert "clip_1_silenced" in video_state.artifacts
+    silenced_artifact_path = pathlib.Path(video_state.artifacts["clip_1_silenced"])
+    assert silenced_artifact_path.exists()
+
+    # Duration should be ~16 s (two 8 s clips)
+    duration = ffprobe_duration_seconds(out_path)
+    assert abs(duration - 16.0) < 1.0, f"Unexpected stitched duration: {duration}"
+
+
+# ---------------------------------------------------------------------------
+# Bug #4 — _silenced.mp4 cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_silenced_intermediate_cleaned_up_with_trimmed_clips(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """cleanup_trimmed=True (default) must delete _silenced files and their artifact keys."""
+    video_state = _make_video_state()
+    video_dir = tmp_path / video_state.video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    # clip_0: has audio; clip_1: silent → will produce clip_1_silenced
+    clip0 = video_dir / "clip_0_trimmed.mp4"
+    clip1 = video_dir / "clip_1_trimmed.mp4"
+    await _add_silent_audio_track(clip_fixture_mp4_path, clip0)
+    shutil.copy2(clip_fixture_mp4_path, clip1)
+    video_state.artifacts["clip_0_trimmed"] = str(clip0)
+    video_state.artifacts["clip_1_trimmed"] = str(clip1)
+
+    await run_stitch(
+        video_state,
+        artifacts_root=tmp_path,
+        cleanup_raw=False,
+        cleanup_trimmed=True,  # default — should also clean _silenced
+    )
+
+    # _silenced artifact key removed
+    assert not any(k.endswith("_silenced") for k in video_state.artifacts)
+    # _silenced file deleted from disk
+    assert not any(video_dir.glob("*_silenced.mp4"))
+    # _trimmed keys also gone
+    assert not any(k.endswith("_trimmed") for k in video_state.artifacts)
+
+
+@pytest.mark.asyncio
+async def test_silenced_intermediate_kept_when_cleanup_trimmed_false(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """cleanup_trimmed=False must leave _silenced files and their artifact keys intact."""
+    video_state = _make_video_state()
+    video_dir = tmp_path / video_state.video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    clip0 = video_dir / "clip_0_trimmed.mp4"
+    clip1 = video_dir / "clip_1_trimmed.mp4"
+    await _add_silent_audio_track(clip_fixture_mp4_path, clip0)
+    shutil.copy2(clip_fixture_mp4_path, clip1)
+    video_state.artifacts["clip_0_trimmed"] = str(clip0)
+    video_state.artifacts["clip_1_trimmed"] = str(clip1)
+
+    await run_stitch(
+        video_state,
+        artifacts_root=tmp_path,
+        cleanup_raw=False,
+        cleanup_trimmed=False,
+    )
+
+    # _silenced artifact key present
+    assert "clip_1_silenced" in video_state.artifacts
+    silenced_path = pathlib.Path(video_state.artifacts["clip_1_silenced"])
+    assert silenced_path.exists()
+
+
+def test_cleanup_after_step_removes_silenced_with_trimmed(tmp_path: pathlib.Path) -> None:
+    """cleanup_after_step with keep_trimmed_clips=False must also delete _silenced artifacts."""
+    video_state = _make_video_state()
+
+    for i in range(2):
+        for suffix in ("_raw", "_trimmed", "_silenced"):
+            f = tmp_path / f"clip_{i}{suffix}.mp4"
+            f.write_bytes(b"dummy")
+            video_state.artifacts[f"clip_{i}{suffix}"] = str(f)
+
+    cleanup_after_step(
+        video_state,
+        "stitch",
+        {"keep_raw_clips": False, "keep_trimmed_clips": False},
+    )
+
+    assert not any(k.endswith("_raw") for k in video_state.artifacts)
+    assert not any(k.endswith("_trimmed") for k in video_state.artifacts)
+    assert not any(k.endswith("_silenced") for k in video_state.artifacts)
+    # All files deleted from disk
+    for i in range(2):
+        for suffix in ("_raw", "_trimmed", "_silenced"):
+            assert not (tmp_path / f"clip_{i}{suffix}.mp4").exists()
+
+
+def test_cleanup_after_step_keeps_silenced_when_keep_trimmed_true(tmp_path: pathlib.Path) -> None:
+    """keep_trimmed_clips=True must also preserve _silenced artifacts."""
+    video_state = _make_video_state()
+
+    silenced = tmp_path / "clip_0_silenced.mp4"
+    silenced.write_bytes(b"dummy")
+    video_state.artifacts["clip_0_silenced"] = str(silenced)
+
+    cleanup_after_step(
+        video_state,
+        "stitch",
+        {"keep_raw_clips": False, "keep_trimmed_clips": True},
+    )
+
+    assert "clip_0_silenced" in video_state.artifacts
+    assert silenced.exists()

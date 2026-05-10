@@ -124,7 +124,7 @@ async def run_trim_for_clip(
     # ------------------------------------------------------------------
     # Update artifacts and log completion
     # ------------------------------------------------------------------
-    video_state.artifacts[trimmed_key] = str(out_path)
+    video_state.artifacts[trimmed_key] = str(out_path.resolve())
 
     duration_ms = int((time.monotonic() - t_start) * 1000)
     log.info(

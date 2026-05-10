@@ -10,6 +10,7 @@ still appears in cost accounting on the next run.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import pathlib
 from dataclasses import dataclass, field
@@ -70,6 +71,7 @@ class NanoBananaClientProtocol(Protocol):
         *,
         prompt: str,
         model: str,
+        reference_image_bytes: bytes | None = None,
     ) -> NanoBananaResult: ...
 
 
@@ -104,12 +106,17 @@ class _DefaultNanoBananaClient:
         *,
         prompt: str,
         model: str,
+        reference_image_bytes: bytes | None = None,
     ) -> NanoBananaResult:
         """Call Nano Banana via google.genai and return a NanoBananaResult.
 
         Passes ``image_config(aspect_ratio="9:16")`` so the model is forced
         to portrait output rather than the default 1:1 square. Falls back to
         no config if the SDK version doesn't support ImageConfig.
+
+        When *reference_image_bytes* is provided, the image is prepended as an
+        inline_data part before the text prompt in the user message, following
+        the multimodal contents shape used in product_analyst.py.
         """
         from google.genai import types  # type: ignore[import-untyped]
 
@@ -123,9 +130,21 @@ class _DefaultNanoBananaClient:
             # Older SDK without ImageConfig — rely on prompt-text aspect hint only.
             pass
 
+        if reference_image_bytes is not None:
+            image_b64 = base64.standard_b64encode(reference_image_bytes).decode()
+            contents = [{
+                "role": "user",
+                "parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": image_b64}},
+                    {"text": prompt},
+                ],
+            }]
+        else:
+            contents = [{"role": "user", "parts": [{"text": prompt}]}]
+
         kwargs: dict = {
             "model": model,
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "contents": contents,
         }
         if config is not None:
             kwargs["config"] = config
@@ -189,6 +208,7 @@ def _make_tenacity_caller(
     global_max_usd: float,
     video_state_path: pathlib.Path,
     run_state_path: pathlib.Path,
+    reference_image_bytes: bytes | None = None,
 ) -> Any:
     """Return an awaitable that retries the image API call up to 5 times.
 
@@ -212,7 +232,11 @@ def _make_tenacity_caller(
         # Bill AFTER the call so 4xx/5xx (no compute consumed) does not pollute
         # the cost tracker. SPEC.md §12 prefers bill-before for long-running ops
         # (Veo); image generation is a single round-trip, so post-billing is safe.
-        result = await client.generate_image(prompt=prompt, model=model)
+        result = await client.generate_image(
+            prompt=prompt,
+            model=model,
+            reference_image_bytes=reference_image_bytes,
+        )
         increment_cost(run_state, video_state, "first_frame_usd", _IMAGE_COST_USD, global_max_usd)
         write_state_atomic(video_state_path, _dump_model(video_state))
         write_state_atomic(run_state_path, _dump_model(run_state))
@@ -241,6 +265,7 @@ async def run_first_frame_for_clip(
     dry_run: bool = False,
     model: str = "gemini-2.5-flash-image",
     product_size_hint: str | None = None,
+    reference_image_bytes: bytes | None = None,
 ) -> pathlib.Path:
     """Generate a first-frame PNG for *clip_index* and return its local path.
 
@@ -306,12 +331,18 @@ async def run_first_frame_for_clip(
     # ------------------------------------------------------------------
     # 2. Render prompt and build PromptVersion
     # ------------------------------------------------------------------
+    _render_kwargs: dict = {}
     if product_size_hint:
-        rendered_prompt = first_frame_prompt.render(
-            spec, brief, clip_index, talent_descriptor, product_size_hint=product_size_hint
+        _render_kwargs["product_size_hint"] = product_size_hint
+
+    if reference_image_bytes is not None:
+        rendered_prompt = first_frame_prompt.render_with_reference(
+            spec, brief, clip_index, talent_descriptor, **_render_kwargs
         )
     else:
-        rendered_prompt = first_frame_prompt.render(spec, brief, clip_index, talent_descriptor)
+        rendered_prompt = first_frame_prompt.render(
+            spec, brief, clip_index, talent_descriptor, **_render_kwargs
+        )
     prompt_sha = hashlib.sha256(rendered_prompt.encode()).hexdigest()
     prompt_version = PromptVersion(
         step_name="first_frame_composite",
@@ -353,7 +384,7 @@ async def run_first_frame_for_clip(
     # nano_banana.location: "global" in pipeline_config.yaml — the preview
     # is currently only served from the `global` Vertex AI endpoint.
 
-    async def _attempt(prompt: str) -> NanoBananaResult:  # type: ignore[return]
+    async def _attempt(prompt: str, ref_bytes: bytes | None = None) -> NanoBananaResult:  # type: ignore[return]
         """One attempt: bill + call, with tenacity on NanoBananaGenerationError."""
         return await _make_tenacity_caller(
             client=client,
@@ -364,21 +395,30 @@ async def run_first_frame_for_clip(
             global_max_usd=global_max_usd,
             video_state_path=video_state_path,
             run_state_path=run_state_path,
+            reference_image_bytes=ref_bytes,
         )
 
     try:
-        result = await _attempt(rendered_prompt)
+        result = await _attempt(rendered_prompt, reference_image_bytes)
     except NanoBananaSafetyError:
-        # Single safety retry with softened prompt — bills again
+        # Single safety retry with softened prompt — bills again.
+        # If a reference image was provided, we KEEP it on retry — only the text is softened.
         log.warning(
             "step_safety_retry",
             step="first_frame_composite",
             video_id=video_state.video_id,
             clip_index=clip_index,
         )
-        softened_prompt = first_frame_prompt.render_softened(spec, brief, clip_index, talent_descriptor)
+        if reference_image_bytes is not None:
+            softened_prompt = first_frame_prompt.render_with_reference_softened(
+                spec, brief, clip_index, talent_descriptor, **_render_kwargs
+            )
+        else:
+            softened_prompt = first_frame_prompt.render_softened(
+                spec, brief, clip_index, talent_descriptor, **_render_kwargs
+            )
         # This attempt also bills via _attempt (which uses _make_tenacity_caller)
-        result = await _attempt(softened_prompt)
+        result = await _attempt(softened_prompt, reference_image_bytes)
 
     # ------------------------------------------------------------------
     # 5. Persist artifact
@@ -386,7 +426,7 @@ async def run_first_frame_for_clip(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(result.png_bytes)
 
-    video_state.artifacts[artifact_key] = str(out_path)
+    video_state.artifacts[artifact_key] = str(out_path.resolve())
     video_state.updated_at = datetime.now(timezone.utc)
     save_video_state(video_state, root=state_root)
 
@@ -431,7 +471,11 @@ async def run_first_frames(
     helper processes clips serially and is used in tests and the CLI.
     """
     paths: list[pathlib.Path] = []
+    clip0_bytes: bytes | None = None
     for clip_index in range(spec.clip_count):
+        # In dry_run, never pass a reference (file doesn't exist); otherwise chain
+        # clip-0 bytes to all subsequent clips.
+        ref = clip0_bytes if (clip_index >= 1 and not dry_run) else None
         path = await run_first_frame_for_clip(
             spec=spec,
             brief=brief,
@@ -444,6 +488,9 @@ async def run_first_frames(
             artifacts_root=artifacts_root,
             global_max_usd=global_max_usd,
             dry_run=dry_run,
+            reference_image_bytes=ref,
         )
+        if clip_index == 0 and not dry_run:
+            clip0_bytes = path.read_bytes()
         paths.append(path)
     return paths

@@ -17,6 +17,7 @@ import pytest
 
 from ugc_pipeline.models import ProductBrief, RunState
 from ugc_pipeline.steps.product_analyst import (
+    derive_product_name,
     estimate_product_analyst_cost_usd,
     run_product_analyst,
 )
@@ -191,6 +192,92 @@ async def test_cost_incremented(tmp_path: pathlib.Path) -> None:
 # ---------------------------------------------------------------------------
 # Test 4: malformed response raises after retries
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Tests for derive_product_name helper
+# ---------------------------------------------------------------------------
+
+_VARIANT_PATTERN = r"[-_ ]v\d+$"
+
+
+def test_derive_product_name_strips_brand_and_variant_suffix() -> None:
+    assert (
+        derive_product_name(
+            "acme-coffee-mug-v2.png", "Acme", variant_suffix_pattern=_VARIANT_PATTERN
+        )
+        == "Coffee Mug"
+    )
+
+
+def test_derive_product_name_case_insensitive_brand_match() -> None:
+    assert (
+        derive_product_name(
+            "ACME-ceramic-cup-v1.jpg", "Acme", variant_suffix_pattern=_VARIANT_PATTERN
+        )
+        == "Ceramic Cup"
+    )
+
+
+def test_derive_product_name_no_brand_prefix() -> None:
+    assert (
+        derive_product_name(
+            "kitchen-blend.png", "Acme", variant_suffix_pattern=_VARIANT_PATTERN
+        )
+        == "Kitchen Blend"
+    )
+
+
+def test_derive_product_name_brand_only_returns_empty() -> None:
+    assert derive_product_name("Acme.png", "Acme") == ""
+
+
+def test_derive_product_name_handles_underscores() -> None:
+    assert (
+        derive_product_name(
+            "Acme_kitchen_blend_v1.jpg", "Acme", variant_suffix_pattern=_VARIANT_PATTERN
+        )
+        == "Kitchen Blend"
+    )
+
+
+def test_derive_product_name_no_brand_argument() -> None:
+    assert derive_product_name("coffee-mug.png", "") == "Coffee Mug"
+
+
+def test_derive_product_name_no_variant_suffix_pattern_keeps_full_stem() -> None:
+    # Default None means no suffix stripping — the trailing token is preserved.
+    assert derive_product_name("acme-coffee-mug-v2.png", "Acme") == "Coffee Mug V2"
+
+
+# ---------------------------------------------------------------------------
+# Test: run_product_analyst sets product_name from filename
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_product_analyst_sets_product_name_from_filename(tmp_path: pathlib.Path) -> None:
+    image_bytes = b"product-name-derivation-test"
+    expected_product_id = hashlib.sha256(image_bytes).hexdigest()[:12]
+
+    brief_dict = _valid_brief_dict()
+    brief_dict["product_id"] = expected_product_id
+    brief_dict["image_path"] = f"assets/products/{expected_product_id}.jpg"
+    client = _make_mock_client(json.dumps(brief_dict))
+    run_state = _make_run_state()
+
+    brief = await run_product_analyst(
+        image_bytes,
+        "acme-test-product-v1.png",
+        None,
+        client=client,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        brand_name="Acme",
+        variant_suffix_pattern=r"[-_ ]v\d+$",
+    )
+
+    assert brief.product_name == "Test Product"
 
 
 @pytest.mark.asyncio

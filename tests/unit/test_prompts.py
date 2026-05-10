@@ -80,7 +80,7 @@ class TestAnalystModule:
 
 class TestDirectorModuleConstants:
     def test_version_present(self) -> None:
-        assert director.VERSION == "1.1.0"
+        assert director.VERSION == "1.4.0"
 
     def test_template_non_empty(self) -> None:
         assert director.TEMPLATE.strip()
@@ -98,7 +98,7 @@ class TestDirectorModuleConstants:
     def test_canonical_tone_names(self) -> None:
         assert "warm storyteller" in TONES
         assert "energetic lifestyle" in TONES
-        assert "serene ASMR" in TONES
+        assert "intimate confidant" in TONES
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ class TestDirectorModuleConstants:
 
 
 class TestDirectorRender:
-    def _render_spec0(self) -> str:
+    def _render_spec0(self, clip_count: int = 2, speaking_clip_index: int = 1) -> str:
         brief = _make_brief()
         from ugc_pipeline.utils.config import get_talent_descriptor
 
@@ -119,8 +119,9 @@ class TestDirectorRender:
             talent_descriptor=get_talent_descriptor("talent_02", _TALENT_POOL),
             tone=tone,
             other_tones=other_tones,
-            clip_count=2,
+            clip_count=clip_count,
             lifestyle_context=brief.lifestyle_contexts[0],
+            speaking_clip_index=speaking_clip_index,
         )
 
     def test_render_contains_chosen_tone(self) -> None:
@@ -136,7 +137,7 @@ class TestDirectorRender:
     def test_render_references_both_other_tones(self) -> None:
         result = self._render_spec0()
         assert "energetic lifestyle" in result
-        assert "serene ASMR" in result
+        assert "intimate confidant" in result
 
     def test_render_contains_talent_descriptor(self) -> None:
         from ugc_pipeline.utils.config import get_talent_descriptor
@@ -220,3 +221,105 @@ class TestDirectorRender:
         assert "Calm, conversational introduction" in result
         assert "Do NOT unbox the product." in result
         assert "Hold the closed package and speak about it." in result
+
+    def test_render_mentions_speaking_clip_index(self) -> None:
+        """The speaking clip index (1) appears in the rendered output."""
+        result = self._render_spec0(speaking_clip_index=1)
+        assert "speaking_clip_index: 1" in result
+
+    def test_render_mentions_silent_marker(self) -> None:
+        """The literal string [silent] appears so the LLM knows what to emit."""
+        result = self._render_spec0()
+        assert "[silent]" in result
+
+    def test_render_mentions_voice_consistency_rationale(self) -> None:
+        """The prompt explains why speech is consolidated into a single clip."""
+        result = self._render_spec0()
+        # The template contains a VOICE CONSOLIDATION RULE section
+        assert "voice" in result.lower() or "consistency" in result.lower() or "single" in result.lower()
+
+    def test_render_mentions_silent_clip_indices(self) -> None:
+        """For clip_count=3, speaking_clip_index=1, silent indices 0 and 2 appear."""
+        result = self._render_spec0(clip_count=3, speaking_clip_index=1)
+        # silent_clip_indices is built as "0, 2"
+        assert "0" in result
+        assert "2" in result
+        # Confirm both appear in the SILENT CLIPS line
+        assert "0, 2" in result
+
+
+# ---------------------------------------------------------------------------
+# Director render — brand guidance placeholder substitution
+# ---------------------------------------------------------------------------
+
+
+class TestDirectorBrandGuidancePlaceholders:
+    """Tests for placeholder substitution in _render_brand_guidance_section."""
+
+    def _render_with_guidance(
+        self,
+        guidance: dict,
+        product_name: str = "",
+        speaking_clip_index: int = 1,
+    ) -> str:
+        from ugc_pipeline.utils.config import get_talent_descriptor
+
+        brief = _make_brief()
+        return director.render(
+            brief=brief,
+            talent_id="talent_02",
+            talent_descriptor=get_talent_descriptor("talent_02", _TALENT_POOL),
+            tone=director.TONES[0],
+            other_tones=[t for t in director.TONES if t != director.TONES[0]],
+            clip_count=2,
+            lifestyle_context=brief.lifestyle_contexts[0],
+            brand_guidance=guidance,
+            speaking_clip_index=speaking_clip_index,
+            product_name=product_name,
+        )
+
+    def test_brand_guidance_substitutes_brand_name_placeholder(self) -> None:
+        """brand_name placeholder in naming_requirement is substituted."""
+        guidance = {
+            "brand_name": "TestBrand",
+            "naming_requirement": "Mention {brand_name} and {product_name}",
+        }
+        result = self._render_with_guidance(guidance, product_name="TestProduct")
+        assert "TestBrand" in result
+        assert "TestProduct" in result
+
+    def test_brand_guidance_substitutes_speaking_clip_index_placeholder(self) -> None:
+        """speaking_clip_index placeholder in must_avoid is substituted."""
+        guidance = {
+            "brand_name": "TestBrand",
+            "must_avoid": ["Check script_blocks[{speaking_clip_index}] carefully."],
+        }
+        result = self._render_with_guidance(guidance, speaking_clip_index=2)
+        assert "script_blocks[2]" in result
+
+    def test_brand_guidance_unknown_placeholder_left_untouched(self) -> None:
+        """Stray placeholders not in the allowed set are left as-is (no crash)."""
+        guidance = {
+            "brand_name": "TestBrand",
+            "should_do": ["Use {some_other_var} here."],
+        }
+        result = self._render_with_guidance(guidance)
+        assert "{some_other_var}" in result
+
+    def test_brand_guidance_naming_requirement_section_emitted(self) -> None:
+        """When naming_requirement is set, NAMING REQUIREMENT: header appears."""
+        guidance = {
+            "brand_name": "TestBrand",
+            "naming_requirement": "Both names must appear naturally.",
+        }
+        result = self._render_with_guidance(guidance)
+        assert "NAMING REQUIREMENT:" in result
+
+    def test_brand_guidance_naming_requirement_absent_no_section(self) -> None:
+        """When naming_requirement is absent, NAMING REQUIREMENT: header does not appear."""
+        guidance = {
+            "brand_name": "TestBrand",
+            "should_do": ["Be conversational."],
+        }
+        result = self._render_with_guidance(guidance)
+        assert "NAMING REQUIREMENT:" not in result

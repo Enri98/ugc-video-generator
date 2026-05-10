@@ -50,7 +50,7 @@ def _video_spec(product_id: str, clip_count: int = 2) -> VideoSpec:
         talent_id="talent_01",
         clip_count=clip_count,
         scene_descriptions=[f"Scene {i}." for i in range(clip_count)],
-        script_blocks=["Ogni mattina." for _ in range(clip_count)],
+        script_blocks=["" if i != 1 else "Ogni mattina." for i in range(clip_count)],
         created_at=datetime.now(timezone.utc),
     )
 

@@ -26,6 +26,7 @@ import tenacity
 from ugc_pipeline.cost_tracker import increment_cost
 from ugc_pipeline.models import ProductBrief, PromptVersion, RunState, VideoSpec, VideoState
 from ugc_pipeline.prompts import safety_retry as safety_retry_prompt
+from ugc_pipeline.prompts import veo as veo_prompt
 from ugc_pipeline.state_manager import (
     _dump_model,
     _run_state_path,
@@ -253,22 +254,33 @@ async def run_safety_retry_for_clip(
     spec: VideoSpec,
     clip_index: int,
     *,
+    full_prompt: str,
     flash_client: GeminiFlashClientProtocol,
     video_state: VideoState,
     run_state: RunState,
     state_root: pathlib.Path,
     global_max_usd: float,
-) -> str:
-    """Rewrite the blocked scene prompt via Gemini Flash and return the new prompt.
+) -> tuple[str, bool]:
+    """Rewrite the blocked full composite prompt via Gemini Flash and return the result.
 
     Bills ``safety_retry_usd`` BEFORE the Gemini Flash call (SPEC.md §12).
+
+    The full structured Veo prompt (SCENE + AUDIO sections, including any Italian
+    voiceover content) is sent to Flash for rewriting. Flash returns the softened
+    full prompt verbatim (preserving SCENE:/AUDIO: structure and Italian language).
+    If Flash returns an empty, too-short, or structurally invalid response (missing
+    SCENE:/AUDIO: markers), falls back to the original ``full_prompt`` and logs a
+    warning event.
 
     Parameters
     ----------
     spec:
-        VideoSpec containing the original scene descriptions.
+        VideoSpec for the current video (used for state logging).
     clip_index:
         0-based index of the clip being retried.
+    full_prompt:
+        The full composite Veo prompt (SCENE + AUDIO sections) that was blocked.
+        This is sent to Flash for rewriting rather than the bare scene description.
     flash_client:
         Gemini Flash client satisfying GeminiFlashClientProtocol.
     video_state:
@@ -282,15 +294,19 @@ async def run_safety_retry_for_clip(
 
     Returns
     -------
-    str
-        The rewritten scene prompt.
+    tuple[str, bool]
+        A 2-tuple of (prompt, flash_succeeded) where:
+        - prompt is the rewritten composite returned by Flash on success, or the
+          original ``full_prompt`` when Flash's output was unusable (fallback).
+        - flash_succeeded is True if Flash returned a structurally valid rewrite,
+          False if the fallback path was taken.
     """
     video_state_path = _video_state_path(video_state.video_id, state_root)
     run_state_path = _run_state_path(run_state.run_id, state_root)
 
-    original_prompt = spec.scene_descriptions[clip_index]
-    rendered_prompt = safety_retry_prompt.render(original_prompt=original_prompt)
+    rendered_prompt = safety_retry_prompt.render(original_prompt=full_prompt)
 
+    # SHA hashes the Flash input (full composite rendered via safety_retry template)
     prompt_sha = hashlib.sha256(rendered_prompt.encode()).hexdigest()
     prompt_version = PromptVersion(
         step_name="safety_retry",
@@ -317,7 +333,7 @@ async def run_safety_retry_for_clip(
         clip_index=clip_index,
     )
 
-    new_prompt = await flash_client.rewrite(rendered_prompt)
+    rewritten_full_prompt = await flash_client.rewrite(rendered_prompt)
 
     log.info(
         "veo_safety_retry_rewrite_done",
@@ -325,7 +341,32 @@ async def run_safety_retry_for_clip(
         clip_index=clip_index,
     )
 
-    return new_prompt
+    # Validate Flash output: must be long enough AND contain structural markers.
+    # Either failure triggers the fallback — caller treats both cases identically.
+    _FLASH_MIN_LENGTH = 30
+    _REQUIRED_MARKERS = ("SCENE:", "AUDIO:")
+
+    if not rewritten_full_prompt or len(rewritten_full_prompt.strip()) < _FLASH_MIN_LENGTH:
+        log.warning(
+            "safety_retry_flash_returned_empty",
+            video_id=video_state.video_id,
+            clip_index=clip_index,
+            returned_length=len(rewritten_full_prompt) if rewritten_full_prompt else 0,
+        )
+        return full_prompt, False
+
+    if not all(marker in rewritten_full_prompt for marker in _REQUIRED_MARKERS):
+        log.warning(
+            "safety_retry_flash_structure_lost",
+            video_id=video_state.video_id,
+            clip_index=clip_index,
+            returned_length=len(rewritten_full_prompt),
+            missing_markers=[m for m in _REQUIRED_MARKERS if m not in rewritten_full_prompt],
+            response_excerpt=rewritten_full_prompt[:200],
+        )
+        return full_prompt, False
+
+    return rewritten_full_prompt, True
 
 
 # ---------------------------------------------------------------------------
@@ -425,10 +466,20 @@ async def run_veo_for_clip(
             return existing_path
 
     # ------------------------------------------------------------------
-    # 2. Dry-run short-circuit
+    # 2. Build structured Veo prompt
     # ------------------------------------------------------------------
-    scene_prompt = spec.scene_descriptions[clip_index]
+    is_speaking = (clip_index == spec.speaking_clip_index)
+    script_block = spec.script_blocks[spec.speaking_clip_index] if is_speaking else ""
+    veo_full_prompt = veo_prompt.render(
+        scene_description=spec.scene_descriptions[clip_index],
+        tone=spec.tone,
+        is_speaking_clip=is_speaking,
+        script_block=script_block,
+    )
 
+    # ------------------------------------------------------------------
+    # 2a. Dry-run short-circuit
+    # ------------------------------------------------------------------
     if dry_run:
         log.info(
             "step_skipped_dryrun",
@@ -436,7 +487,9 @@ async def run_veo_for_clip(
             video_id=video_state.video_id,
             clip_index=clip_index,
             estimated_cost_usd=estimate_veo_clip_cost_usd(),
-            scene_prompt=scene_prompt,
+            veo_full_prompt=veo_full_prompt,
+            is_speaking_clip=is_speaking,
+            **({"script_block_excerpt": script_block[:60]} if is_speaking else {}),
         )
         return out_path
 
@@ -517,10 +570,18 @@ async def run_veo_for_clip(
         )
 
     # ------------------------------------------------------------------
-    # 5. First attempt
+    # 5. Record prompt version and first attempt
     # ------------------------------------------------------------------
+    prompt_sha = hashlib.sha256(veo_full_prompt.encode()).hexdigest()
+    video_state.prompt_versions["veo"] = PromptVersion(
+        step_name="veo_generation",
+        version=veo_prompt.VERSION,
+        content_sha256=prompt_sha,
+        rendered_at=datetime.now(timezone.utc),
+    )
+
     try:
-        veo_result = await _submit_and_poll(scene_prompt)
+        veo_result = await _submit_and_poll(veo_full_prompt)
     except VeoSafetyBlockError:
         log.warning(
             "veo_safety_block",
@@ -530,10 +591,11 @@ async def run_veo_for_clip(
         if flash_client is None:
             raise
 
-        # Safety retry (Step 6): rewrite and re-submit once
-        rewritten_prompt = await run_safety_retry_for_clip(
+        # Safety retry (Step 6): rewrite the full composite and re-submit once
+        rewritten_prompt, flash_succeeded = await run_safety_retry_for_clip(
             spec,
             clip_index,
+            full_prompt=veo_full_prompt,
             flash_client=flash_client,
             video_state=video_state,
             run_state=run_state,
@@ -564,6 +626,32 @@ async def run_veo_for_clip(
         write_state_atomic(video_state_path, _dump_model(video_state))
         write_state_atomic(run_state_path, _dump_model(run_state))
 
+        # Re-record prompt_versions["veo"] with the SHA of the actually-submitted
+        # rewritten prompt ONLY when Flash produced a valid rewrite. If Flash fell
+        # back to the original prompt, leave prompt_versions["veo"] intact so the
+        # audit trail accurately reflects which prompt was submitted.
+        if flash_succeeded:
+            retry_prompt_sha = hashlib.sha256(rewritten_prompt.encode()).hexdigest()
+            video_state.prompt_versions["veo"] = PromptVersion(
+                step_name="veo_generation",
+                version=veo_prompt.VERSION,
+                content_sha256=retry_prompt_sha,
+                rendered_at=datetime.now(timezone.utc),
+            )
+            log.info(
+                "veo_safety_retry_prompt_versions_updated",
+                video_id=video_state.video_id,
+                clip_index=clip_index,
+                prompt_sha=retry_prompt_sha,
+            )
+        else:
+            log.info(
+                "veo_safety_retry_prompt_versions_unchanged",
+                video_id=video_state.video_id,
+                clip_index=clip_index,
+                reason="flash_fallback_used_original_prompt",
+            )
+
         log.info(
             "veo_operation_submitted",
             video_id=video_state.video_id,
@@ -586,7 +674,7 @@ async def run_veo_for_clip(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(veo_result.mp4_bytes)
 
-    video_state.artifacts[artifact_key] = str(out_path)
+    video_state.artifacts[artifact_key] = str(out_path.resolve())
     video_state.updated_at = datetime.now(timezone.utc)
     save_video_state(video_state, root=state_root)
     save_run_state(run_state, root=state_root)
@@ -635,6 +723,7 @@ class _DefaultVeoClient:
         resolution: str = "720p",
         duration_seconds: int = 8,
         person_generation: str = "allow_adult",
+        generate_audio: bool = True,
     ) -> None:
         from google import genai  # type: ignore[import-untyped]
         from google.oauth2 import service_account  # type: ignore[import-untyped]
@@ -654,6 +743,7 @@ class _DefaultVeoClient:
         self._resolution = resolution
         self._duration_seconds = duration_seconds
         self._person_generation = person_generation
+        self._generate_audio = generate_audio
         # operation.name -> operation object (in-memory cache, single session)
         self._op_cache: dict[str, object] = {}
 
@@ -673,6 +763,8 @@ class _DefaultVeoClient:
             number_of_videos=1,
             duration_seconds=self._duration_seconds,
             person_generation=self._person_generation,
+            generate_audio=self._generate_audio,
+            enhance_prompt=False,
         )
         operation = await self._client.aio.models.generate_videos(
             model=model or self._model,
@@ -753,6 +845,7 @@ def make_default_veo_client(
     resolution: str = "720p",
     duration_seconds: int = 8,
     person_generation: str = "allow_adult",
+    generate_audio: bool = True,
 ) -> _DefaultVeoClient:
     """Build the default Vertex AI Veo client adapter satisfying VeoClientProtocol."""
     return _DefaultVeoClient(
@@ -764,6 +857,7 @@ def make_default_veo_client(
         resolution=resolution,
         duration_seconds=duration_seconds,
         person_generation=person_generation,
+        generate_audio=generate_audio,
     )
 
 
@@ -822,7 +916,7 @@ async def drain_inflight_veo(
                 out_path.write_bytes(veo_result.mp4_bytes)
 
                 artifact_key = f"clip_{op.clip_index}_raw"
-                video_state.artifacts[artifact_key] = str(out_path)
+                video_state.artifacts[artifact_key] = str(out_path.resolve())
                 video_state.updated_at = datetime.now(timezone.utc)
                 save_video_state(video_state, root=state_root)
                 save_run_state(run_state, root=state_root)

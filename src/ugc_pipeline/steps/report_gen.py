@@ -206,7 +206,7 @@ async def run_report_gen(
     out_path = video_dir / "report.txt"
     out_path.write_text(text, encoding="utf-8")
 
-    video_state.artifacts["report"] = str(out_path)
+    video_state.artifacts["report"] = str(out_path.resolve())
 
     duration_ms = int((time.monotonic() - t_start) * 1000)
     log.info(

@@ -51,7 +51,7 @@ def _make_spec(**overrides: object) -> VideoSpec:
         "talent_id": "talent_02",
         "clip_count": 2,
         "scene_descriptions": ["Scene A.", "Scene B."],
-        "script_blocks": ["Testo italiano uno.", "Testo italiano due."],
+        "script_blocks": ["", "Testo italiano due."],
     }
     defaults.update(overrides)
     return VideoSpec(**defaults)  # type: ignore[arg-type]

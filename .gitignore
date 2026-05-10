@@ -85,3 +85,7 @@ Thumbs.db
 scratch/
 notes.local.md
 .claude/
+
+# Ad-hoc one-off scripts (gitignored except .example.yaml)
+scripts/adhoc/*
+!scripts/adhoc/*.example.yaml

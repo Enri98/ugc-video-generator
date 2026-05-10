@@ -43,7 +43,8 @@ def _make_video_spec(video_id: str, clip_count: int = 1) -> VideoSpec:
         talent_id="talent_01",
         clip_count=clip_count,
         scene_descriptions=["Scene description."] * clip_count,
-        script_blocks=["Testo italiano."] * clip_count,
+        script_blocks=["Testo italiano."] + [""] * (clip_count - 1),
+        speaking_clip_index=0,
         created_at=datetime.now(timezone.utc),
     )
 

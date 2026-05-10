@@ -74,7 +74,7 @@ def _video_spec(product_id: str, spec_index: int = 0, clip_count: int = 2) -> Vi
             f"Scene {i} description." for i in range(clip_count)
         ],
         script_blocks=[
-            "Ogni mattina merita cura." for _ in range(clip_count)
+            "" if i != 1 else "Ogni mattina merita cura." for i in range(clip_count)
         ],
         created_at=datetime.now(timezone.utc),
     )
@@ -421,7 +421,7 @@ async def test_run_pipeline_cost_tracked(
         talent_id="talent_01",
         clip_count=2,
         scene_descriptions=["scene 0", "scene 1"],
-        script_blocks=["Ogni mattina.", "La ceramica."],
+        script_blocks=["", "La ceramica."],
         created_at=datetime.now(timezone.utc),
     )
     fake_specs = [
@@ -474,3 +474,363 @@ async def test_run_pipeline_cost_tracked(
     assert run_state.cumulative_cost_usd > 0, (
         f"Expected cumulative_cost_usd > 0, got {run_state.cumulative_cost_usd}"
     )
+
+
+# ---------------------------------------------------------------------------
+# _step_first_frame chaining tests
+# ---------------------------------------------------------------------------
+
+
+def _make_step_first_frame_context(
+    tmp_path: pathlib.Path,
+    nano_banana_client: MagicMock,
+    dry_run: bool = False,
+) -> tuple[OrchestratorContext, VideoState, VideoSpec, ProductBrief, RunState]:
+    """Build minimal state + context for calling _step_first_frame directly."""
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir(parents=True, exist_ok=True)
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    product_id = "chain_test_product"
+    spec = _video_spec(product_id, spec_index=0, clip_count=3)
+    brief = _product_brief(product_id, tmp_path)
+
+    video_state = VideoState(
+        video_id=spec.video_id,
+        product_id=product_id,
+        spec_index=0,
+    )
+    run_state = _run_state()
+
+    save_product_brief(brief, root=state_root)
+    save_video_spec(spec, root=state_root)
+    save_video_state(video_state, root=state_root)
+    save_run_state(run_state, root=state_root)
+
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+    ctx = _make_context(
+        state_root, artifacts_root, nano_banana_client, veo_client, flash_client,
+        dry_run=dry_run,
+    )
+    return ctx, video_state, spec, brief, run_state
+
+
+@pytest.mark.asyncio
+async def test_step_first_frame_runs_clip0_first_then_parallel(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Clip 0 must run first (reference_image_bytes=None); clips 1 and 2 receive clip 0's bytes."""
+    # Each call returns a distinct PNG so we can track per-call bytes
+    clip0_png = b"\x89PNG\r\n\x1a\n" + b"\xAA" * 80
+    clip1_png = b"\x89PNG\r\n\x1a\n" + b"\xBB" * 80
+    clip2_png = b"\x89PNG\r\n\x1a\n" + b"\xCC" * 80
+
+    call_sequence: list[NanoBananaResult] = [
+        NanoBananaResult(png_bytes=clip0_png),
+        NanoBananaResult(png_bytes=clip1_png),
+        NanoBananaResult(png_bytes=clip2_png),
+    ]
+    nb_client = MagicMock()
+    nb_client.generate_image = AsyncMock(side_effect=call_sequence)
+
+    from ugc_pipeline.orchestrator import _step_first_frame
+
+    ctx, video_state, spec, brief, run_state = _make_step_first_frame_context(tmp_path, nb_client)
+
+    await _step_first_frame(video_state, spec, brief, run_state, ctx)
+
+    # Must have called generate_image exactly 3 times (one per clip)
+    assert nb_client.generate_image.call_count == 3
+
+    calls = nb_client.generate_image.call_args_list
+
+    # First call (clip 0): reference_image_bytes must be None
+    first_call_kwargs = calls[0].kwargs
+    assert first_call_kwargs.get("reference_image_bytes") is None, (
+        f"Clip 0 should have reference_image_bytes=None, got {first_call_kwargs.get('reference_image_bytes')!r}"
+    )
+
+    # Subsequent calls (clips 1 and 2): reference_image_bytes must equal clip 0's PNG bytes
+    for idx, call in enumerate(calls[1:], start=1):
+        ref = call.kwargs.get("reference_image_bytes")
+        ref_preview = repr(ref[:20]) if ref else repr(ref)
+        assert ref == clip0_png, (
+            f"Call {idx} should have clip 0 bytes as reference, got {ref_preview}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_step_first_frame_dry_run_skips_byte_read(
+    tmp_path: pathlib.Path,
+) -> None:
+    """In dry_run mode, no FileNotFoundError should occur and all calls get reference_image_bytes=None."""
+    # In dry_run, run_first_frame_for_clip returns a path that doesn't exist on disk.
+    # The orchestrator must NOT call path.read_bytes() in this case.
+    nb_client = MagicMock()
+    # dry_run short-circuits before the API call — generate_image never called
+    nb_client.generate_image = AsyncMock(return_value=NanoBananaResult(png_bytes=_FAKE_PNG))
+
+    from ugc_pipeline.orchestrator import _step_first_frame
+
+    ctx, video_state, spec, brief, run_state = _make_step_first_frame_context(
+        tmp_path, nb_client, dry_run=True
+    )
+
+    # Must not raise FileNotFoundError even though the PNG does not exist on disk
+    await _step_first_frame(video_state, spec, brief, run_state, ctx)
+
+    # In dry_run, run_first_frame_for_clip exits before calling the API —
+    # generate_image should not have been called at all.
+    nb_client.generate_image.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_step_first_frame_resume_uses_clip0_from_disk(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When clip 0 is excluded from the admitted batch (already done), load its bytes
+    from disk and pass them as reference_image_bytes to the admitted clips."""
+    from unittest.mock import patch
+
+    from ugc_pipeline.orchestrator import _step_first_frame
+
+    # Write a distinct clip 0 PNG to disk so we can verify it was forwarded
+    clip0_png = b"\x89PNG\r\n\x1a\n" + b"\xDD" * 80
+    clip1_png = b"\x89PNG\r\n\x1a\n" + b"\xEE" * 80
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir(parents=True, exist_ok=True)
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    product_id = "resume_chain_product"
+    spec = _video_spec(product_id, spec_index=0, clip_count=2)
+    brief = _product_brief(product_id, tmp_path)
+
+    # Write clip 0 artifact to disk
+    video_dir = artifacts_root / spec.video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+    clip0_path = video_dir / "clip_0_firstframe.png"
+    clip0_path.write_bytes(clip0_png)
+
+    # Video state shows clip 0 already done
+    video_state = VideoState(
+        video_id=spec.video_id,
+        product_id=product_id,
+        spec_index=0,
+        artifacts={"clip_0_firstframe": str(clip0_path)},
+    )
+    run_state = _run_state()
+
+    save_product_brief(brief, root=state_root)
+    save_video_spec(spec, root=state_root)
+    save_video_state(video_state, root=state_root)
+    save_run_state(run_state, root=state_root)
+
+    nb_client = MagicMock()
+    nb_client.generate_image = AsyncMock(return_value=NanoBananaResult(png_bytes=clip1_png))
+
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+
+    # Patch admit_clip_batch to return only [1] — simulating that clip 0 was already admitted
+    # in a prior run and is now excluded from the batch.
+    with patch(
+        "ugc_pipeline.orchestrator.admit_clip_batch",
+        return_value=[1],
+    ):
+        await _step_first_frame(video_state, spec, brief, run_state, ctx)
+
+    # Clip 0 must NOT have been regenerated
+    # Clip 1 must have been called exactly once with clip 0's bytes as reference
+    assert nb_client.generate_image.call_count == 1, (
+        f"Expected 1 call for clip 1 only, got {nb_client.generate_image.call_count}"
+    )
+    call_kwargs = nb_client.generate_image.call_args_list[0].kwargs
+    actual_ref = call_kwargs.get("reference_image_bytes")
+    actual_preview = repr(actual_ref[:20]) if actual_ref else repr(actual_ref)
+    assert actual_ref == clip0_png, (
+        f"Clip 1 should have received clip 0 bytes as reference, got {actual_preview}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _validate_creative_director_config tests (Bug #7 pre-flight validation)
+# ---------------------------------------------------------------------------
+
+
+from ugc_pipeline.orchestrator import _validate_creative_director_config
+
+
+class TestValidateCreativeDirectorConfig:
+    def _cfg(self, speaking_clip_index: int, clip_counts: list) -> dict:
+        return {
+            "creative_director": {
+                "speaking_clip_index": speaking_clip_index,
+                "clip_counts": clip_counts,
+            }
+        }
+
+    def test_rejects_speaking_clip_index_equal_to_clip_count(self) -> None:
+        """speaking_clip_index=1 with clip_count=1 is out of range (must be < 1)."""
+        cfg = self._cfg(speaking_clip_index=1, clip_counts=[1])
+        with pytest.raises(ValueError) as exc_info:
+            _validate_creative_director_config(cfg)
+        msg = str(exc_info.value)
+        assert "speaking_clip_index" in msg
+        assert "clip_counts" in msg
+
+    def test_rejects_negative_speaking_clip_index(self) -> None:
+        """A negative speaking_clip_index must always be rejected."""
+        cfg = self._cfg(speaking_clip_index=-1, clip_counts=[2, 3, 2])
+        with pytest.raises(ValueError) as exc_info:
+            _validate_creative_director_config(cfg)
+        assert "speaking_clip_index" in str(exc_info.value)
+
+    def test_rejects_speaking_clip_index_too_large(self) -> None:
+        """speaking_clip_index=5 with clip_counts=[2, 3, 2] is invalid for clips 0 and 2."""
+        cfg = self._cfg(speaking_clip_index=5, clip_counts=[2, 3, 2])
+        with pytest.raises(ValueError) as exc_info:
+            _validate_creative_director_config(cfg)
+        assert "speaking_clip_index" in str(exc_info.value)
+
+    def test_accepts_valid_speaking_clip_index(self) -> None:
+        """speaking_clip_index=1 with clip_counts=[2, 3, 2] satisfies 1<2, 1<3, 1<2."""
+        cfg = self._cfg(speaking_clip_index=1, clip_counts=[2, 3, 2])
+        # Must not raise
+        _validate_creative_director_config(cfg)
+
+    def test_accepts_default_config(self) -> None:
+        """An empty creative_director section should use defaults and not raise."""
+        _validate_creative_director_config({})
+
+    def test_rejects_zero_clip_count(self) -> None:
+        """speaking_clip_index=0 with clip_count=0 violates 0 <= idx < 0."""
+        cfg = self._cfg(speaking_clip_index=0, clip_counts=[0])
+        with pytest.raises(ValueError):
+            _validate_creative_director_config(cfg)
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_rejects_bad_speaking_clip_index_zero_clipcount(
+    tmp_path: pathlib.Path,
+) -> None:
+    """run_pipeline must raise ValueError immediately for a bad speaking_clip_index."""
+    from ugc_pipeline.orchestrator import run_pipeline
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir()
+    artifacts_root.mkdir()
+
+    run_state = _run_state()
+    save_run_state(run_state, root=state_root)
+
+    nb_client = _make_mock_nano_banana(_FAKE_PNG)
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+
+    # Inject bad config: speaking_clip_index=1 with clip_count=1 is out of range
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+    ctx.cfg["creative_director"] = {
+        "speaking_clip_index": 1,
+        "clip_counts": [1],
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        await run_pipeline([], ctx, run_state, per_video_max_usd=8.0, global_max_usd=50.0)
+    msg = str(exc_info.value)
+    assert "speaking_clip_index" in msg
+    assert "clip_counts" in msg
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_rejects_negative_speaking_clip_index(
+    tmp_path: pathlib.Path,
+) -> None:
+    """run_pipeline must raise ValueError for a negative speaking_clip_index."""
+    from ugc_pipeline.orchestrator import run_pipeline
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir()
+    artifacts_root.mkdir()
+
+    run_state = _run_state()
+    save_run_state(run_state, root=state_root)
+
+    nb_client = _make_mock_nano_banana(_FAKE_PNG)
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+    ctx.cfg["creative_director"] = {
+        "speaking_clip_index": -1,
+        "clip_counts": [2, 3, 2],
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        await run_pipeline([], ctx, run_state, per_video_max_usd=8.0, global_max_usd=50.0)
+    assert "speaking_clip_index" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_rejects_speaking_clip_index_too_large(
+    tmp_path: pathlib.Path,
+) -> None:
+    """run_pipeline must raise ValueError when speaking_clip_index >= min(clip_counts)."""
+    from ugc_pipeline.orchestrator import run_pipeline
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir()
+    artifacts_root.mkdir()
+
+    run_state = _run_state()
+    save_run_state(run_state, root=state_root)
+
+    nb_client = _make_mock_nano_banana(_FAKE_PNG)
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+    ctx.cfg["creative_director"] = {
+        "speaking_clip_index": 5,
+        "clip_counts": [2, 3, 2],
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        await run_pipeline([], ctx, run_state, per_video_max_usd=8.0, global_max_usd=50.0)
+    assert "speaking_clip_index" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_accepts_valid_speaking_clip_index(
+    tmp_path: pathlib.Path,
+) -> None:
+    """run_pipeline must NOT raise when speaking_clip_index=1 with clip_counts=[2,3,2]."""
+    from ugc_pipeline.orchestrator import run_pipeline
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir()
+    artifacts_root.mkdir()
+
+    run_state = _run_state()
+    save_run_state(run_state, root=state_root)
+
+    nb_client = _make_mock_nano_banana(_FAKE_PNG)
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+    ctx.cfg["creative_director"] = {
+        "speaking_clip_index": 1,
+        "clip_counts": [2, 3, 2],
+    }
+
+    # Pass empty image list — no actual work will be done after validation passes
+    await run_pipeline([], ctx, run_state, per_video_max_usd=8.0, global_max_usd=50.0)

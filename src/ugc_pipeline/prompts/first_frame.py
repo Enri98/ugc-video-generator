@@ -15,6 +15,15 @@ from ugc_pipeline.models import ProductBrief, VideoSpec
 
 VERSION = "1.2.0"
 
+REFERENCE_PREAMBLE = (
+    "REFERENCE IMAGE PROVIDED: A reference image of the same talent and the same "
+    "product is attached as the first input. Use it as the authoritative source for: "
+    "the person's face, hair, body type, wardrobe, and the product's shape/colour/"
+    "packaging. Only the scene, pose, framing, and lighting may change between this "
+    "image and the reference — the identity of the person and product MUST be "
+    "preserved exactly."
+)
+
 TEMPLATE = """\
 Generate a photorealistic vertical portrait-format still image.
 ASPECT RATIO: 9:16 vertical (portrait orientation, taller than wide). This is a TikTok / Reels / Shorts framing — strictly NOT square, NOT landscape.
@@ -115,6 +124,29 @@ def render(
     )
 
 
+_SAFETY_PREAMBLE = (
+    "A tasteful, brand-safe still image with no people in close physical contact: "
+)
+
+
+def _soften(body: str, *, preamble: str = "") -> str:
+    """Apply heuristic safety softening to an already-rendered prompt body.
+
+    Strips blocklist words from *body* only, then returns:
+        ``_SAFETY_PREAMBLE + preamble + body_softened``
+
+    The *preamble* argument (e.g. ``REFERENCE_PREAMBLE + "\\n\\n"``) is
+    inserted verbatim between the safety preamble and the softened body —
+    blocklist replacement is deliberately NOT applied to it. Rule-based only —
+    no LLM involvement.
+    """
+    softened = body
+    for word in _SAFETY_BLOCKLIST:
+        softened = softened.replace(word, "")
+        softened = softened.replace(word.capitalize(), "")
+    return _SAFETY_PREAMBLE + preamble + softened
+
+
 def render_softened(
     spec: VideoSpec,
     brief: ProductBrief,
@@ -133,15 +165,86 @@ def render_softened(
     produce the ideal prompt.
     """
     base_prompt = render(spec, brief, clip_index, talent_descriptor, product_size_hint)
+    return _soften(base_prompt)
 
-    # Strip blocklist words (case-insensitive, whole-word-ish replacement)
-    softened = base_prompt
-    for word in _SAFETY_BLOCKLIST:
-        softened = softened.replace(word, "")
-        softened = softened.replace(word.capitalize(), "")
 
-    # Prepend the safety preamble
-    preamble = (
-        "A tasteful, brand-safe still image with no people in close physical contact: "
-    )
-    return preamble + softened
+def render_with_reference(
+    spec: VideoSpec,
+    brief: ProductBrief,
+    clip_index: int,
+    talent_descriptor: str,
+    product_size_hint: str = _DEFAULT_SIZE_HINT,
+) -> str:
+    """Render the first-frame prompt for clip_index, prepending the reference-image preamble.
+
+    For clip i ≥ 1, the caller should attach the clip-0 PNG bytes as the first
+    image input alongside this prompt. The preamble instructs the model to anchor
+    person identity and product appearance on the reference image; only scene,
+    pose, framing, and lighting may vary.
+
+    For clip 0 the caller should still use the plain ``render()`` function (no
+    reference image exists yet). This function does not enforce that constraint
+    in code — the caller is responsible for the clip-0 / clip-i distinction.
+
+    Parameters
+    ----------
+    spec:
+        The VideoSpec for the current video.
+    brief:
+        The ProductBrief describing the product.
+    clip_index:
+        Which clip (0-based) this first frame is for.
+    talent_descriptor:
+        Human-readable description of the talent (gender, age, aesthetic, etc.)
+        resolved from the talent pool.
+    product_size_hint:
+        Optional override for the product scale description.
+
+    Returns
+    -------
+    str
+        The fully rendered image-generation prompt with the REFERENCE_PREAMBLE
+        prepended.
+    """
+    base_prompt = render(spec, brief, clip_index, talent_descriptor, product_size_hint)
+    return REFERENCE_PREAMBLE + "\n\n" + base_prompt
+
+
+def render_with_reference_softened(
+    spec: VideoSpec,
+    brief: ProductBrief,
+    clip_index: int,
+    talent_descriptor: str,
+    product_size_hint: str = _DEFAULT_SIZE_HINT,
+) -> str:
+    """Return a softened, reference-anchored variant of the first-frame prompt.
+
+    Combines ``render_with_reference()`` with the heuristic safety softening
+    applied by ``render_softened()``. The output order is: safety preamble
+    first, then the reference instruction, then the base prompt body.
+
+    The reference instruction (``REFERENCE_PREAMBLE``) is left intact — only
+    the body of the rendered prompt is softened (blocklist words stripped).
+    This guarantees that identity-preservation instructions cannot be
+    accidentally mangled by future blocklist changes.
+
+    Parameters
+    ----------
+    spec:
+        The VideoSpec for the current video.
+    brief:
+        The ProductBrief describing the product.
+    clip_index:
+        Which clip (0-based) this first frame is for.
+    talent_descriptor:
+        Human-readable description of the talent resolved from the talent pool.
+    product_size_hint:
+        Optional override for the product scale description.
+
+    Returns
+    -------
+    str
+        The fully rendered, softened, reference-anchored prompt.
+    """
+    base_prompt = render(spec, brief, clip_index, talent_descriptor, product_size_hint)
+    return _soften(base_prompt, preamble=REFERENCE_PREAMBLE + "\n\n")

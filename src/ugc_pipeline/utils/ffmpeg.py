@@ -90,6 +90,45 @@ def ffprobe_duration_seconds(path: Path) -> float:
     return float(duration)
 
 
+def ffprobe_has_audio(path: Path) -> bool:
+    """Return True if the file at *path* contains at least one audio stream.
+
+    Uses PyAV (which bundles its own libav) rather than relying on a system
+    ffprobe binary.
+
+    Parameters
+    ----------
+    path:
+        Absolute or relative path to any media file readable by libav.
+
+    Returns
+    -------
+    bool
+        True if the container has at least one audio stream, False otherwise.
+
+    Raises
+    ------
+    FfmpegError
+        If the file cannot be opened.
+    """
+    try:
+        import av  # type: ignore[import-untyped]
+
+        container = av.open(str(path))
+        try:
+            has_audio = any(s.type == "audio" for s in container.streams)
+        finally:
+            container.close()
+    except FfmpegError:
+        raise
+    except Exception as exc:
+        raise FfmpegError(
+            f"Failed to probe audio streams of {path!r}: {exc}"
+        ) from exc
+
+    return has_audio
+
+
 def ffprobe_dimensions(path: Path) -> tuple[int, int]:
     """Return the (width, height) of the first video stream in *path*.
 

@@ -125,7 +125,7 @@ def _make_spec(**kw: object) -> VideoSpec:
         "talent_id": "talent_01",
         "clip_count": 3,
         "scene_descriptions": ["A.", "B.", "C."],
-        "script_blocks": ["Uno.", "Due.", "Tre."],
+        "script_blocks": ["", "Due.", ""],
     }
     defaults.update(kw)
     return VideoSpec(**defaults)  # type: ignore[arg-type]

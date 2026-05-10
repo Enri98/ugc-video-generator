@@ -49,7 +49,7 @@ _CANNED_BRIEF = ProductBrief(
 
 def _make_canned_spec(spec_index: int) -> VideoSpec:
     vid = str(uuid.uuid4())
-    tones = ["warm storyteller", "energetic lifestyle", "serene ASMR"]
+    tones = ["warm storyteller", "energetic lifestyle", "intimate confidant"]
     return VideoSpec(
         video_id=vid,
         product_id=_PRODUCT_ID,
@@ -63,7 +63,7 @@ def _make_canned_spec(spec_index: int) -> VideoSpec:
             f"Spec {spec_index} clip 1: talent places the product on a sunlit surface.",
         ],
         script_blocks=[
-            "Ogni mattina merita un piccolo gesto di cura.",
+            "",
             "La ceramica scalda le mani.",
         ],
         visual_style_notes="Warm amber tone grading, soft window backlight.",
