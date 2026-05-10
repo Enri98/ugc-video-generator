@@ -1,0 +1,26 @@
+# Copy to `config/brand_guidance.yaml` (gitignored) and fill in the real,
+# brand-specific positioning. The orchestrator passes the loaded dict to
+# the creative director and first-frame prompts so they can produce
+# scenes consistent with how the product is meant to be presented.
+#
+# All fields are optional; an empty file is equivalent to "no extra guidance".
+
+# Free-form positioning paragraph the director will treat as authoritative
+# context for what the product is and how it should be framed in the video.
+positioning: |
+  A small consumer product. The talent introduces it, holds it as-is, and
+  speaks about its qualities in a calm, conversational register.
+
+# Hard rules the director and first-frame prompts MUST respect. Use these
+# to forbid specific behaviours that the model otherwise tends to invent
+# (e.g. unboxing, revealing internal contents, demonstrating use cases the
+# product was not designed for).
+must_avoid:
+  - "The talent must NOT unbox, open, disassemble, or otherwise reveal the contents of any packaging."
+  - "Do not invent or show items hidden inside the product or its packaging."
+  - "Scene descriptions must not include unwrapping, opening boxes, or removing items from containers."
+
+# Positive behavioural directions — what the talent SHOULD do.
+should_do:
+  - "Hold the closed product/package and speak about it directly."
+  - "Frame the product clearly so its shape and packaging are recognisable."

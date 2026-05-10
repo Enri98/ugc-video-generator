@@ -125,6 +125,9 @@ class OrchestratorContext:
     # Talent pool (raw dict from load_talent_pool)
     talent_pool: dict[str, dict[str, Any]]
 
+    # Brand guidance (raw dict from load_brand_guidance; empty when absent)
+    brand_guidance: dict[str, Any] = field(default_factory=dict)
+
     # Operating mode
     dry_run: bool = False
 
@@ -211,6 +214,9 @@ async def _step_first_frame(
 
     talent_descriptor = get_talent_descriptor(spec.talent_id, ctx.talent_pool)
     client = ctx.effective_nano_banana_client()
+    nb_cfg = cfg.get("nano_banana", {})
+    nb_model = str(nb_cfg.get("model", "gemini-2.5-flash-image"))
+    nb_size_hint = nb_cfg.get("product_size_hint") or None  # None -> prompt default
 
     tasks = [
         run_first_frame_for_clip(
@@ -225,6 +231,8 @@ async def _step_first_frame(
             artifacts_root=ctx.artifacts_root,
             global_max_usd=global_max,
             dry_run=ctx.dry_run,
+            model=nb_model,
+            product_size_hint=nb_size_hint,
         )
         for i in clip_indices
     ]
@@ -284,6 +292,22 @@ async def _step_veo(
     await asyncio.gather(*tasks)
 
 
+def _dry_run_skip(step_name: str, video_state: VideoState) -> None:
+    """Emit a step_skipped_dryrun log event for a local post-production step.
+
+    Per SPEC.md §11, the local steps (trim/stitch/caption) would normally run
+    against a placeholder video in dry-run; v1 simply skips them since first_frame
+    and veo were skipped upstream and there is no real artifact to operate on.
+    """
+    from ugc_pipeline.utils.logging import get_logger
+
+    get_logger(__name__).info(
+        "step_skipped_dryrun",
+        step=step_name,
+        video_id=video_state.video_id,
+    )
+
+
 async def _step_trim(
     video_state: VideoState,
     spec: VideoSpec,
@@ -292,6 +316,10 @@ async def _step_trim(
     ctx: OrchestratorContext,
 ) -> None:
     """Run end_of_clip_trim for all clips in the video."""
+    if ctx.dry_run:
+        _dry_run_skip("end_of_clip_trim", video_state)
+        return
+
     from ugc_pipeline.steps.trim import run_trim_for_clip
 
     cfg = ctx.cfg
@@ -317,6 +345,10 @@ async def _step_stitch(
     ctx: OrchestratorContext,
 ) -> None:
     """Run stitch for the video."""
+    if ctx.dry_run:
+        _dry_run_skip("stitch", video_state)
+        return
+
     from ugc_pipeline.steps.stitch import cleanup_after_step, run_stitch
 
     await run_stitch(video_state, artifacts_root=ctx.artifacts_root)
@@ -331,16 +363,24 @@ async def _step_caption(
     ctx: OrchestratorContext,
 ) -> None:
     """Run caption for the video."""
+    if ctx.dry_run:
+        _dry_run_skip("caption", video_state)
+        return
+
     from ugc_pipeline.steps.caption import run_caption
 
     cfg = ctx.cfg
-    caption_max_chars = int(cfg.get("post_production", {}).get("caption_max_chars_per_line", 42))
+    pp = cfg.get("post_production", {})
 
     await run_caption(
         video_state,
         spec,
         artifacts_root=ctx.artifacts_root,
-        max_chars_per_line=caption_max_chars,
+        max_chars_per_line=int(pp.get("caption_max_chars_per_line", 30)),
+        video_w=int(pp.get("video_width", 720)),
+        video_h=int(pp.get("video_height", 1280)),
+        font=str(pp.get("caption_font", "Arial")),
+        font_size=int(pp.get("caption_font_size", 44)),
     )
 
 
@@ -371,6 +411,10 @@ async def _step_drive_upload(
     ctx: OrchestratorContext,
 ) -> None:
     """Run drive_upload for the video."""
+    if ctx.dry_run:
+        _dry_run_skip("drive_upload", video_state)
+        return
+
     from ugc_pipeline.steps.drive_upload import run_drive_upload
 
     await run_drive_upload(
@@ -611,6 +655,11 @@ async def run_pipeline(
                 return
 
             # Stage 3 — creative_director
+            cd_cfg = ctx.cfg.get("creative_director", {})
+            clip_counts_cfg = cd_cfg.get("clip_counts")
+            cd_kwargs: dict = {}
+            if clip_counts_cfg:
+                cd_kwargs["clip_counts"] = tuple(int(c) for c in clip_counts_cfg)
             try:
                 specs = await run_creative_director(
                     brief,
@@ -619,6 +668,8 @@ async def run_pipeline(
                     run_state=run_state,
                     state_root=ctx.state_root,
                     global_max_usd=global_max_usd,
+                    brand_guidance=ctx.brand_guidance or None,
+                    **cd_kwargs,
                 )
             except Exception as exc:
                 log.error("creative_director_failed", product_id=img.product_id, error=str(exc))

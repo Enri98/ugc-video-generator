@@ -64,7 +64,11 @@ def cli_entry(argv: list[str] | None = None) -> None:
 
     # Configure structlog + stdlib logging
     from ugc_pipeline.utils.logging import configure_logging
-    from ugc_pipeline.utils.config import load_pipeline_config, load_talent_pool
+    from ugc_pipeline.utils.config import (
+        load_brand_guidance,
+        load_pipeline_config,
+        load_talent_pool,
+    )
 
     cfg = load_pipeline_config()
     log_cfg = cfg.get("logging", {})
@@ -84,6 +88,14 @@ def cli_entry(argv: list[str] | None = None) -> None:
     except FileNotFoundError as exc:
         log.error("talent_pool_not_found", error=str(exc))
         sys.exit(1)
+
+    # Load optional brand guidance (empty dict if file is absent)
+    brand_guidance = load_brand_guidance()
+    if brand_guidance:
+        log.info(
+            "brand_guidance_loaded",
+            keys=sorted(brand_guidance.keys()),
+        )
 
     # Build clients
     gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
@@ -145,7 +157,16 @@ def cli_entry(argv: list[str] | None = None) -> None:
         )
     else:
         from ugc_pipeline.steps.first_frame import make_default_client as _make_nb
-        nano_banana_client = _make_nb(gcp_project, gcp_location, creds_path_str)
+        # Allow per-step location override: Gemini 3 Pro Image preview is
+        # currently only deployed in `global`, not regional endpoints.
+        nb_location = str(cfg.get("nano_banana", {}).get("location", gcp_location))
+        nano_banana_client = _make_nb(gcp_project, nb_location, creds_path_str)
+        log.info(
+            "nano_banana_client_initialised",
+            project=gcp_project,
+            location=nb_location,
+            model=str(cfg.get("nano_banana", {}).get("model", "gemini-2.5-flash-image")),
+        )
 
     # Veo client
     if mock_everything or dry_run:
@@ -156,10 +177,32 @@ def cli_entry(argv: list[str] | None = None) -> None:
             return_value={"done": True, "mp4_bytes": b"fakemp4", "error": None, "safety_block": False}
         )
     else:
-        # Real Veo client — Day 8 wiring; for now raise informative error.
-        log.error("veo_client_not_wired", reason="Real Veo client requires Day 8 setup.")
-        raise NotImplementedError(
-            "Real Veo client is not yet wired. Use --mock-everything for smoke testing."
+        from ugc_pipeline.steps.veo import make_default_veo_client
+        veo_cfg = cfg.get("veo", {})
+        pp_cfg = cfg.get("post_production", {})
+        if not (gcp_project and creds_path_str):
+            log.critical("veo_config_missing", project=bool(gcp_project), creds=bool(creds_path_str))
+            print(
+                "ERROR: Veo on Vertex AI requires GOOGLE_CLOUD_PROJECT and a service account JSON.\n"
+                "Set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, and GOOGLE_APPLICATION_CREDENTIALS.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        veo_client = make_default_veo_client(
+            project=gcp_project,
+            location=gcp_location,
+            credentials_path=creds_path_str,
+            model=str(veo_cfg.get("model", "veo-3.1-fast-generate-preview")),
+            aspect_ratio=str(veo_cfg.get("aspect_ratio", "9:16")),
+            resolution=str(veo_cfg.get("resolution", "720p")),
+            duration_seconds=int(veo_cfg.get("duration_seconds", 8)),
+            person_generation=str(veo_cfg.get("person_generation", "allow_adult")),
+        )
+        log.info(
+            "veo_client_initialised",
+            model=str(veo_cfg.get("model", "veo-3.1-fast-generate-preview")),
+            aspect_ratio=str(veo_cfg.get("aspect_ratio", "9:16")),
+            resolution=str(veo_cfg.get("resolution", "720p")),
         )
 
     # Gemini Flash client (safety retry)
@@ -182,11 +225,14 @@ def cli_entry(argv: list[str] | None = None) -> None:
 
         flash_client = _FlashAdapter(gemini_pro_client)
 
-    # Rate limiters (aiolimiter)
+    # Rate limiters (aiolimiter) — read RPM from config (with sensible defaults).
     try:
         from aiolimiter import AsyncLimiter  # type: ignore[import-untyped]
-        gemini_limiter = AsyncLimiter(60, 60)   # 60 RPM
-        nano_banana_limiter = AsyncLimiter(30, 60)  # 30 RPM
+        gemini_rpm = int(cfg.get("gemini", {}).get("rpm", 60))
+        nb_rpm = int(cfg.get("nano_banana", {}).get("rpm", 30))
+        gemini_limiter = AsyncLimiter(gemini_rpm, 60)
+        nano_banana_limiter = AsyncLimiter(nb_rpm, 60)
+        log.info("rate_limiters_initialised", gemini_rpm=gemini_rpm, nano_banana_rpm=nb_rpm)
     except ImportError:
         gemini_limiter = None
         nano_banana_limiter = None
@@ -216,6 +262,7 @@ def cli_entry(argv: list[str] | None = None) -> None:
         output_reports_folder_id=output_reports_folder_id or None,
         cfg=cfg,
         talent_pool=talent_pool,
+        brand_guidance=brand_guidance,
         dry_run=dry_run,
         gemini_limiter=gemini_limiter,
         nano_banana_limiter=nano_banana_limiter,

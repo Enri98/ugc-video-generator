@@ -78,6 +78,51 @@ async def test_run_stitch_happy_path(
 
 
 # ---------------------------------------------------------------------------
+# Regression: relative artifacts_root must not produce a doubled path
+# in the concat list (ffmpeg's concat demuxer resolves entries against
+# the concat file's directory).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_stitch_relative_artifacts_root(
+    clip_fixture_mp4_path: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When artifacts_root is relative, concat entries must still be absolute."""
+    monkeypatch.chdir(tmp_path)
+    artifacts_root = pathlib.Path("artifacts")  # relative, like the real CLI
+
+    video_state = _make_video_state()
+    video_dir = artifacts_root / video_state.video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(2):
+        dst = video_dir / f"clip_{i}_trimmed.mp4"
+        shutil.copy2(clip_fixture_mp4_path, dst)
+        video_state.artifacts[f"clip_{i}_trimmed"] = str(dst)  # relative path
+
+    out_path = await run_stitch(
+        video_state,
+        artifacts_root=artifacts_root,
+        cleanup_raw=False,
+        cleanup_trimmed=False,
+    )
+
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
+
+    # Concat list entries must be absolute, not relative.
+    concat_text = (video_dir / "concat_list.txt").read_text(encoding="utf-8")
+    for line in concat_text.splitlines():
+        # Format: file '<path>'
+        path_str = line.removeprefix("file ").strip().strip("'")
+        assert pathlib.Path(path_str).is_absolute(), (
+            f"Concat entry must be absolute, got: {path_str!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Cleanup: raw and trimmed deleted after stitch
 # ---------------------------------------------------------------------------
 

@@ -17,6 +17,7 @@ CLAUDE.md
 
 # Brand-specific configs and prompts
 config/brand_guidelines.yaml
+config/brand_guidance.yaml
 config/talent_pool.yaml
 config/pipeline_config.yaml
 config/*.private.yaml
@@ -30,6 +31,7 @@ assets/
 !assets/.gitkeep
 !assets/README.md
 fixtures/
+artifacts/
 
 # Runtime state and outputs
 state/

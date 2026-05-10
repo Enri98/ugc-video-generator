@@ -95,6 +95,37 @@ def load_talent_pool(path: pathlib.Path | None = None) -> dict[str, dict[str, An
 
 
 # ---------------------------------------------------------------------------
+# Brand guidance (optional)
+# ---------------------------------------------------------------------------
+
+
+def load_brand_guidance(path: pathlib.Path | None = None) -> dict[str, Any]:
+    """Load optional brand guidance YAML and return it as a plain dict.
+
+    Resolution order:
+    1. *path* if explicitly provided (FileNotFoundError if missing).
+    2. ``config/brand_guidance.yaml`` (gitignored, real positioning).
+    3. Empty dict if neither file exists — brand guidance is opt-in.
+
+    The returned dict is passed to the creative director and first-frame
+    prompts so they can incorporate the project's positioning, hard rules,
+    and behavioural directions without leaking domain-specific language
+    into tracked source files.
+    """
+    if path is not None:
+        if not path.is_file():
+            raise FileNotFoundError(f"Brand guidance file not found: {path}")
+        with path.open("r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+
+    candidate = _DEFAULT_CONFIG_DIR / "brand_guidance.yaml"
+    if candidate.is_file():
+        with candidate.open("r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Talent descriptor rendering
 # ---------------------------------------------------------------------------
 

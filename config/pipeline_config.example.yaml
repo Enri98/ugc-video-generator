@@ -1,48 +1,71 @@
-# Generic, publishable pipeline configuration example.
-# Copy to `pipeline_config.yaml` and adjust. The brand-specific YAML files
-# (`brand_guidelines.yaml`, `talent_pool.yaml`) are gitignored — see SPEC.md §9.
+# Copy to `pipeline_config.yaml` and adjust. 
+#
+# This file's key layout matches what the orchestrator actually reads
+# (parallelism.*, budget.*, veo.*, post_production.*, paths.*, logging.*,
+# cleanup.*). Do not rename keys without updating the orchestrator.
 
-drive:
-  poll_interval_seconds: 60
-  input_folder_env: GOOGLE_DRIVE_INPUT_FOLDER_ID
-  output_videos_folder_env: GOOGLE_DRIVE_OUTPUT_VIDEOS_FOLDER_ID
-  output_reports_folder_env: GOOGLE_DRIVE_OUTPUT_REPORTS_FOLDER_ID
-  accepted_mime_types:
-    - image/jpeg
-    - image/png
-    - image/webp
+version: "1.0.0"
 
-concurrency:
-  veo_max_concurrent: 4
-  gemini_rpm: 60
-  nano_banana_rpm: 30
+poll:
+  interval_seconds: 300        # ignored in v1 (one-shot mode); reserved for daemon mode
 
-retries:
-  veo_safety_max: 1
-  rate_limit_max: 5
-  rate_limit_initial_backoff_seconds: 2
+parallelism:
+  max_concurrent_products: 2
+  max_concurrent_veo_ops: 4
+
+retry:
+  max_attempts: 5
+  base_delay_seconds: 2
+  max_delay_seconds: 60
+
+veo:
+  model: "veo-3.1-fast-generate-preview"   # google-genai 2.x model id; tune to your tier
+  poll_interval_seconds: 15
+  poll_timeout_seconds: 360    # 6 minutes; Veo ops typically complete in 90-300s
+  aspect_ratio: "9:16"         # passed to Veo submit
+  resolution: "720p"           # Veo 3.1 Fast output resolution
+  duration_seconds: 8          # per-clip length; Veo 3.1 Fast supports 5-8s
+  person_generation: "allow_adult"   # required when first-frame contains an adult human
+
+gemini:
+  rpm: 60                      # Gemini 2.5 Pro requests per minute (proactive aiolimiter cap)
+
+nano_banana:
+  # Default works in us-central1 (Nano Banana 1 / Gemini 2.5 Flash Image, GA).
+  # To use Gemini 3 Pro Image Preview ("Nano Banana 2"), uncomment both lines:
+  #   model: "gemini-3-pro-image-preview"
+  #   location: "global"
+  model: "gemini-2.5-flash-image"
+  # location: <inherits GOOGLE_CLOUD_LOCATION when unset>
+  rpm: 30                      # Nano Banana requests per minute (proactive aiolimiter cap)
+
+budget:
+  per_video_max_usd: 8.00
+  global_max_usd: 50.00
+  max_cost_per_clip_usd: 0.60  # used for admission control worst-case estimate
 
 post_production:
   trim_tail_seconds: 0.5
-  output_resolution: "1080x1920"
-  output_fps: 30
-
-budget:
-  per_video_max_usd: 8.0
-  global_max_usd: 50.0
-  abort_on_global: true
+  caption_max_chars_per_line: 30   # tighter wrapping for 720px-wide vertical
+  video_width: 720             # final video pixel width (must match Veo output)
+  video_height: 1280           # final video pixel height (9:16 vertical)
+  caption_font: "Arial"
+  caption_font_size: 44        # scaled down for 720p vs 1080p
 
 cleanup:
-  keep_first_frames: true
   keep_raw_clips: false
   keep_trimmed_clips: false
-  keep_final_video: true
+
+paths:
+  state_dir: "state"
+  artifacts_dir: "artifacts"
+  logs_dir: "logs"
+  credentials_dir: "credentials"
 
 logging:
-  level: INFO
-  json_file: logs/pipeline.log
-  rotation_bytes: 10485760
-  rotation_backups: 5
+  level: "INFO"                # overridden by LOG_LEVEL env var
+  log_file: "logs/pipeline.log"
+  max_bytes: 10485760          # 10 MB
+  backup_count: 5
 
-dry_run:
-  enabled_by_default: false
+dry_run: false                 # overridden by --dry-run CLI flag

@@ -121,7 +121,8 @@ async def run_creative_director(
     run_state: RunState,
     state_root: pathlib.Path,
     global_max_usd: float = 50.0,
-    clip_counts: tuple[int, int, int] = (2, 3, 2),
+    clip_counts: tuple[int, ...] = (2, 3, 2),
+    brand_guidance: dict | None = None,
 ) -> list[VideoSpec]:
     """Run the creative director step and return three VideoSpec objects.
 
@@ -151,7 +152,7 @@ async def run_creative_director(
     sorted_talent_ids = sorted(talent_pool.keys())
     specs: list[VideoSpec] = []
 
-    for spec_index in range(3):
+    for spec_index in range(len(clip_counts)):
         # Idempotency: check whether a spec already exists for this position
         existing = _find_existing_spec(brief.product_id, spec_index, state_root)
         if existing is not None:
@@ -184,6 +185,7 @@ async def run_creative_director(
             other_tones=other_tones,
             clip_count=clip_count,
             lifestyle_context=lifestyle_context,
+            brand_guidance=brand_guidance,
         )
         prompt_version = PromptVersion(
             step_name="creative_director",

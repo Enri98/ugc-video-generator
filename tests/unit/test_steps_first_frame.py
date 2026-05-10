@@ -283,8 +283,9 @@ async def test_safety_retry_success(tmp_path: pathlib.Path) -> None:
     assert out_path.exists()
     assert video_state.artifacts["clip_0_firstframe"] == str(out_path)
 
-    # Cost billed twice (once per attempt)
-    expected_cost = 2 * estimate_first_frame_cost_usd()
+    # Cost billed once: bill-after-success protocol means the failed first
+    # attempt does not bill; only the successful softened-prompt retry does.
+    expected_cost = estimate_first_frame_cost_usd()
     assert video_state.costs_usd.first_frame_usd == pytest.approx(expected_cost)
 
 
@@ -374,8 +375,10 @@ async def test_generation_error_transient_retry(tmp_path: pathlib.Path) -> None:
     assert out_path.exists()
     assert video_state.artifacts["clip_0_firstframe"] == str(out_path)
 
-    # Cost billed 3 times (once per attempt — SPEC.md §12 protocol)
-    expected_cost = 3 * estimate_first_frame_cost_usd()
+    # Cost billed only once: bill-after-success protocol — the two failed
+    # NanoBananaGenerationError attempts produce no compute and are not billed;
+    # only the successful third attempt bills.
+    expected_cost = estimate_first_frame_cost_usd()
     assert video_state.costs_usd.first_frame_usd == pytest.approx(expected_cost)
     assert run_state.cumulative_cost_usd == pytest.approx(expected_cost)
 

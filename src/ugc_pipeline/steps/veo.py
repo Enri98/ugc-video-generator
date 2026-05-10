@@ -160,7 +160,7 @@ async def submit_veo_operation(
     *,
     image_bytes: bytes,
     prompt: str,
-    model: str = "veo-3.1-fast",
+    model: str = "",
 ) -> str:
     """Submit an image-to-video operation to Veo and return the operation_id.
 
@@ -469,7 +469,21 @@ async def run_veo_for_clip(
         stored_op_id = video_state.artifacts.get(op_key)
 
         if stored_op_id is None:
-            # Bill BEFORE the submit call (SPEC.md §12)
+            # Submit FIRST. Only bill once we have an operation_id back — that
+            # is the point at which Veo has accepted the job and committed
+            # compute. 4xx/5xx submit failures (model-not-found, invalid args,
+            # quota) consume no compute and must not pollute the cost tracker.
+            operation_id = await submit_veo_operation(
+                client,
+                image_bytes=image_bytes,
+                prompt=prompt,
+            )
+            # Store operation_id so a crash during poll allows resume
+            video_state.artifacts[op_key] = operation_id
+            write_state_atomic(video_state_path, _dump_model(video_state))
+
+            # Now bill — the LRO is in flight and any subsequent crash would
+            # leave us paying for compute we never collect (SPEC.md §12 rationale).
             increment_cost(
                 run_state,
                 video_state,
@@ -479,15 +493,6 @@ async def run_veo_for_clip(
             )
             write_state_atomic(video_state_path, _dump_model(video_state))
             write_state_atomic(run_state_path, _dump_model(run_state))
-
-            operation_id = await submit_veo_operation(
-                client,
-                image_bytes=image_bytes,
-                prompt=prompt,
-            )
-            # Store operation_id so a crash during poll allows resume
-            video_state.artifacts[op_key] = operation_id
-            write_state_atomic(video_state_path, _dump_model(video_state))
 
             log.info(
                 "veo_operation_submitted",
@@ -539,7 +544,16 @@ async def run_veo_for_clip(
         # Clear the stored op_key so _submit_and_poll does a fresh submit
         video_state.artifacts.pop(op_key, None)
 
-        # Bill the second Veo submit BEFORE calling
+        # Submit FIRST, bill AFTER op_id received (same rationale as above:
+        # 4xx submit errors consume no compute).
+        second_op_id = await submit_veo_operation(
+            client,
+            image_bytes=image_bytes,
+            prompt=rewritten_prompt,
+        )
+        video_state.artifacts[op_key] = second_op_id
+        write_state_atomic(video_state_path, _dump_model(video_state))
+
         increment_cost(
             run_state,
             video_state,
@@ -549,14 +563,6 @@ async def run_veo_for_clip(
         )
         write_state_atomic(video_state_path, _dump_model(video_state))
         write_state_atomic(run_state_path, _dump_model(run_state))
-
-        second_op_id = await submit_veo_operation(
-            client,
-            image_bytes=image_bytes,
-            prompt=rewritten_prompt,
-        )
-        video_state.artifacts[op_key] = second_op_id
-        write_state_atomic(video_state_path, _dump_model(video_state))
 
         log.info(
             "veo_operation_submitted",
@@ -602,6 +608,163 @@ async def run_veo_for_clip(
 # ---------------------------------------------------------------------------
 # Kill-switch drain helper  (SPEC.md §12 + §13)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Default Vertex AI Veo client adapter
+# ---------------------------------------------------------------------------
+
+
+class _DefaultVeoClient:
+    """Veo 3.1 Fast image-to-video adapter using google-genai 2.x on Vertex AI.
+
+    The protocol uses ``operation.name`` (a fully-qualified resource name) as
+    the operation_id. The full operation object is cached in-process so that
+    successive polls reuse it; on a fresh process the cache is cold and the
+    SDK is asked to re-fetch by name.
+    """
+
+    def __init__(
+        self,
+        project: str,
+        location: str,
+        credentials_path: str,
+        *,
+        model: str = "veo-3.1-fast-generate-preview",
+        aspect_ratio: str = "9:16",
+        resolution: str = "720p",
+        duration_seconds: int = 8,
+        person_generation: str = "allow_adult",
+    ) -> None:
+        from google import genai  # type: ignore[import-untyped]
+        from google.oauth2 import service_account  # type: ignore[import-untyped]
+
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        self._client = genai.Client(
+            vertexai=True,
+            project=project,
+            location=location,
+            credentials=credentials,
+        )
+        self._model = model
+        self._aspect_ratio = aspect_ratio
+        self._resolution = resolution
+        self._duration_seconds = duration_seconds
+        self._person_generation = person_generation
+        # operation.name -> operation object (in-memory cache, single session)
+        self._op_cache: dict[str, object] = {}
+
+    async def submit(
+        self,
+        *,
+        image_bytes: bytes,
+        prompt: str,
+        model: str = "",
+    ) -> str:
+        from google.genai import types  # type: ignore[import-untyped]
+
+        image = types.Image(image_bytes=image_bytes, mime_type="image/png")
+        config = types.GenerateVideosConfig(
+            aspect_ratio=self._aspect_ratio,
+            resolution=self._resolution,
+            number_of_videos=1,
+            duration_seconds=self._duration_seconds,
+            person_generation=self._person_generation,
+        )
+        operation = await self._client.aio.models.generate_videos(
+            model=model or self._model,
+            prompt=prompt,
+            image=image,
+            config=config,
+        )
+        op_name = getattr(operation, "name", None)
+        if not op_name:
+            raise VeoGenerationError(
+                "Veo submit returned an operation without a 'name' field; cannot poll."
+            )
+        self._op_cache[op_name] = operation
+        return op_name
+
+    async def poll(self, operation_id: str) -> dict:
+        cached = self._op_cache.get(operation_id)
+        try:
+            if cached is not None:
+                op = await self._client.aio.operations.get(cached)
+            else:
+                op = await self._client.aio.operations.get(operation_id)
+        except Exception as exc:  # noqa: BLE001 — network error path
+            return {
+                "done": False,
+                "mp4_bytes": None,
+                "error": f"poll transient: {exc}",
+                "safety_block": False,
+            }
+        self._op_cache[operation_id] = op
+
+        if not getattr(op, "done", False):
+            return {"done": False, "mp4_bytes": None, "error": None, "safety_block": False}
+
+        op_error = getattr(op, "error", None)
+        if op_error:
+            msg = str(op_error)
+            blocked = ("safety" in msg.lower()) or ("blocked" in msg.lower())
+            return {"done": True, "mp4_bytes": None, "error": msg, "safety_block": blocked}
+
+        # Extract video bytes from the response payload.
+        try:
+            response = op.response
+            generated = response.generated_videos[0]
+            video = generated.video
+            mp4_bytes = getattr(video, "video_bytes", None)
+            if not mp4_bytes:
+                uri = getattr(video, "uri", None)
+                if uri:
+                    fetched = await self._client.aio.files.download(uri)
+                    mp4_bytes = getattr(fetched, "content", fetched)
+        except (AttributeError, IndexError, TypeError) as exc:
+            return {
+                "done": True,
+                "mp4_bytes": None,
+                "error": f"Unexpected Veo response shape: {exc}",
+                "safety_block": False,
+            }
+
+        if not mp4_bytes:
+            return {
+                "done": True,
+                "mp4_bytes": None,
+                "error": "Veo operation done but no video bytes available.",
+                "safety_block": False,
+            }
+
+        return {"done": True, "mp4_bytes": bytes(mp4_bytes), "error": None, "safety_block": False}
+
+
+def make_default_veo_client(
+    project: str,
+    location: str,
+    credentials_path: str,
+    *,
+    model: str = "veo-3.1-fast-generate-preview",
+    aspect_ratio: str = "9:16",
+    resolution: str = "720p",
+    duration_seconds: int = 8,
+    person_generation: str = "allow_adult",
+) -> _DefaultVeoClient:
+    """Build the default Vertex AI Veo client adapter satisfying VeoClientProtocol."""
+    return _DefaultVeoClient(
+        project=project,
+        location=location,
+        credentials_path=credentials_path,
+        model=model,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        duration_seconds=duration_seconds,
+        person_generation=person_generation,
+    )
 
 
 async def drain_inflight_veo(

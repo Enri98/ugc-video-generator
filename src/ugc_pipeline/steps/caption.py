@@ -145,11 +145,11 @@ def _wrap_text(text: str, max_chars: int) -> str:
 def render_ass(
     segments: list[dict],
     *,
-    max_chars_per_line: int = 42,
-    video_w: int = 1080,
-    video_h: int = 1920,
+    max_chars_per_line: int = 30,
+    video_w: int = 720,
+    video_h: int = 1280,
     font: str = "Arial",
-    font_size: int = 64,
+    font_size: int = 44,
 ) -> str:
     """Render a SubStation Alpha v4+ (.ass) subtitle string.
 
@@ -265,7 +265,11 @@ async def run_caption(
     spec: VideoSpec,
     *,
     artifacts_root: Path,
-    max_chars_per_line: int = 42,
+    max_chars_per_line: int = 30,
+    video_w: int = 720,
+    video_h: int = 1280,
+    font: str = "Arial",
+    font_size: int = 44,
 ) -> Path:
     """Transcribe, render subtitles, and burn captions into the stitched video.
 
@@ -336,7 +340,14 @@ async def run_caption(
     # ------------------------------------------------------------------
     # Render .ass subtitle file
     # ------------------------------------------------------------------
-    ass_text = render_ass(segments, max_chars_per_line=max_chars_per_line)
+    ass_text = render_ass(
+        segments,
+        max_chars_per_line=max_chars_per_line,
+        video_w=video_w,
+        video_h=video_h,
+        font=font,
+        font_size=font_size,
+    )
     ass_path = video_dir / "captions.ass"
     ass_path.write_text(ass_text, encoding="utf-8")
     video_state.artifacts["captions_ass"] = str(ass_path)

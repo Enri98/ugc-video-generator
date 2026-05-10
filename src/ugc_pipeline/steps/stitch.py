@@ -188,7 +188,10 @@ async def run_stitch(
     video_dir.mkdir(parents=True, exist_ok=True)
     concat_list = video_dir / "concat_list.txt"
 
-    lines = [f"file {quote_concat_path(p)}" for p in clip_paths]
+    # ffmpeg's concat demuxer resolves relative entries against the concat
+    # file's directory, not the CWD — so we always write absolute paths to
+    # avoid a doubled-prefix lookup when artifacts_root itself is relative.
+    lines = [f"file {quote_concat_path(p.resolve())}" for p in clip_paths]
     concat_list.write_text("\n".join(lines), encoding="utf-8")
 
     # ------------------------------------------------------------------

@@ -2,8 +2,9 @@
 
 See SPEC.md §6.3 for the canonical template shape and the coffee-cup fixture
 rendering. This prompt is sent to Nano Banana 2 (Gemini 3 Flash Image) to
-produce a 1080x1920 PNG for each clip. No Italian content — this step produces
-a visual asset.
+produce a 720x1280 PNG for each clip (9:16 vertical, matches the 720p Veo
+output resolution configured in pipeline_config.yaml). No Italian content —
+this step produces a visual asset.
 """
 
 from __future__ import annotations
@@ -12,12 +13,16 @@ import hashlib
 
 from ugc_pipeline.models import ProductBrief, VideoSpec
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 
 TEMPLATE = """\
-Generate a photorealistic vertical portrait-format still image (1080x1920 px, 9:16 aspect ratio).
+Generate a photorealistic vertical portrait-format still image.
+ASPECT RATIO: 9:16 vertical (portrait orientation, taller than wide). This is a TikTok / Reels / Shorts framing — strictly NOT square, NOT landscape.
 
 SUBJECT: {subject_description}
+
+PRODUCT SCALE: {product_size_hint}
+The product MUST be rendered at realistic, hand-held human scale. Use the talent's hand and body as the size reference. Never render the product larger than the talent's torso. If the product appears oversized relative to the talent, the image is wrong.
 
 TALENT: {talent_descriptor}
 {talent_action}
@@ -37,11 +42,18 @@ CONTENT_SHA256 = hashlib.sha256(TEMPLATE.encode()).hexdigest()
 _SAFETY_BLOCKLIST: list[str] = ["close-up", "intimate", "embrace"]
 
 
+_DEFAULT_SIZE_HINT = (
+    "A small consumer product roughly 20-25 cm tall, sized to be held comfortably "
+    "in one or two hands like a paperback book or a tall coffee mug."
+)
+
+
 def render(
     spec: VideoSpec,
     brief: ProductBrief,
     clip_index: int,
     talent_descriptor: str,
+    product_size_hint: str = _DEFAULT_SIZE_HINT,
 ) -> str:
     """Render the first-frame prompt for *clip_index* in *spec*.
 
@@ -82,8 +94,9 @@ def render(
         else "Photorealistic UGC aesthetic. Natural skin tones. No studio lighting artefacts."
     )
 
-    # Talent action derived from scene description
-    talent_action = "Expression: calm, intentional. She is not looking at the camera in this frame."
+    # Talent action derived from scene description.
+    # Pronoun-neutral phrasing — talent gender varies across the talent pool.
+    talent_action = "Expression: calm, intentional. Looking away from the camera in this frame."
 
     # Forward motion hint is a fixed string per SPEC.md §5 step 4
     forward_motion_hint = (
@@ -98,6 +111,7 @@ def render(
         colour_palette=colour_palette,
         visual_style_notes=visual_style_notes,
         forward_motion_hint=forward_motion_hint,
+        product_size_hint=product_size_hint,
     )
 
 
@@ -106,6 +120,7 @@ def render_softened(
     brief: ProductBrief,
     clip_index: int,
     talent_descriptor: str,
+    product_size_hint: str = _DEFAULT_SIZE_HINT,
 ) -> str:
     """Return a softened variant of the first-frame prompt.
 
@@ -117,7 +132,7 @@ def render_softened(
     phrasing. The goal is to pass safety filters on a single retry, not to
     produce the ideal prompt.
     """
-    base_prompt = render(spec, brief, clip_index, talent_descriptor)
+    base_prompt = render(spec, brief, clip_index, talent_descriptor, product_size_hint)
 
     # Strip blocklist words (case-insensitive, whole-word-ish replacement)
     softened = base_prompt

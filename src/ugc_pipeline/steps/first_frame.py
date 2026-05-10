@@ -54,7 +54,7 @@ class NanoBananaResult:
     """Container for a successful image generation result."""
 
     png_bytes: bytes
-    model: str = "gemini-3-flash-image"
+    model: str = "gemini-3-pro-image-preview"
 
 
 # ---------------------------------------------------------------------------
@@ -105,14 +105,31 @@ class _DefaultNanoBananaClient:
         prompt: str,
         model: str,
     ) -> NanoBananaResult:
-        """Call Nano Banana 2 via google.genai and return a NanaBananaResult.
+        """Call Nano Banana via google.genai and return a NanoBananaResult.
 
-        # TODO Day 8: validate against google-genai 2.0 image API surface.
+        Passes ``image_config(aspect_ratio="9:16")`` so the model is forced
+        to portrait output rather than the default 1:1 square. Falls back to
+        no config if the SDK version doesn't support ImageConfig.
         """
-        response = await self._client.aio.models.generate_content(
-            model=model,
-            contents=[{"role": "user", "parts": [{"text": prompt}]}],
-        )
+        from google.genai import types  # type: ignore[import-untyped]
+
+        config = None
+        try:
+            config = types.GenerateContentConfig(
+                image_config=types.ImageConfig(aspect_ratio="9:16"),
+                response_modalities=["IMAGE"],
+            )
+        except (AttributeError, TypeError):
+            # Older SDK without ImageConfig — rely on prompt-text aspect hint only.
+            pass
+
+        kwargs: dict = {
+            "model": model,
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        }
+        if config is not None:
+            kwargs["config"] = config
+        response = await self._client.aio.models.generate_content(**kwargs)
         try:
             # Extract PNG bytes from the first candidate's inline data
             part = response.candidates[0].content.parts[0]
@@ -192,12 +209,14 @@ def _make_tenacity_caller(
         reraise=True,
     )
     async def _call() -> NanoBananaResult:
-        # Bill BEFORE the call so a crash still registers cost
+        # Bill AFTER the call so 4xx/5xx (no compute consumed) does not pollute
+        # the cost tracker. SPEC.md §12 prefers bill-before for long-running ops
+        # (Veo); image generation is a single round-trip, so post-billing is safe.
+        result = await client.generate_image(prompt=prompt, model=model)
         increment_cost(run_state, video_state, "first_frame_usd", _IMAGE_COST_USD, global_max_usd)
         write_state_atomic(video_state_path, _dump_model(video_state))
         write_state_atomic(run_state_path, _dump_model(run_state))
-
-        return await client.generate_image(prompt=prompt, model=model)
+        return result
 
     return _call()
 
@@ -220,6 +239,8 @@ async def run_first_frame_for_clip(
     artifacts_root: pathlib.Path,
     global_max_usd: float = 50.0,
     dry_run: bool = False,
+    model: str = "gemini-2.5-flash-image",
+    product_size_hint: str | None = None,
 ) -> pathlib.Path:
     """Generate a first-frame PNG for *clip_index* and return its local path.
 
@@ -285,7 +306,12 @@ async def run_first_frame_for_clip(
     # ------------------------------------------------------------------
     # 2. Render prompt and build PromptVersion
     # ------------------------------------------------------------------
-    rendered_prompt = first_frame_prompt.render(spec, brief, clip_index, talent_descriptor)
+    if product_size_hint:
+        rendered_prompt = first_frame_prompt.render(
+            spec, brief, clip_index, talent_descriptor, product_size_hint=product_size_hint
+        )
+    else:
+        rendered_prompt = first_frame_prompt.render(spec, brief, clip_index, talent_descriptor)
     prompt_sha = hashlib.sha256(rendered_prompt.encode()).hexdigest()
     prompt_version = PromptVersion(
         step_name="first_frame_composite",
@@ -320,7 +346,12 @@ async def run_first_frame_for_clip(
     # ------------------------------------------------------------------
     # 4. Call with safety retry
     # ------------------------------------------------------------------
-    model = "gemini-3-flash-image"
+    # `model` is the kwarg above. Default is "gemini-2.5-flash-image" (Nano
+    # Banana 1 / Gemini 2.5 Flash Image, GA, available in us-central1).
+    # To use Gemini 3 Pro Image Preview ("Nano Banana 2") set
+    # nano_banana.model: "gemini-3-pro-image-preview" AND
+    # nano_banana.location: "global" in pipeline_config.yaml — the preview
+    # is currently only served from the `global` Vertex AI endpoint.
 
     async def _attempt(prompt: str) -> NanoBananaResult:  # type: ignore[return]
         """One attempt: bill + call, with tenacity on NanoBananaGenerationError."""

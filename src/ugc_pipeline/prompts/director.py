@@ -15,7 +15,7 @@ import hashlib
 
 from ugc_pipeline.models import ProductBrief
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 TONES: list[str] = [
     "warm storyteller",
@@ -40,7 +40,7 @@ Descriptor: {talent_descriptor}
 
 TONE FOR THIS SPEC: {tone}
 (The other two specs in this batch will use "{other_tones}" — do NOT use those tones here.)
-
+{brand_guidance_section}
 REQUIREMENTS:
 - clip_count: {clip_count}
 - narrative_arc: one sentence describing the emotional journey of the video
@@ -54,6 +54,43 @@ Respond in valid JSON conforming to the VideoSpec schema.\
 CONTENT_SHA256 = hashlib.sha256(TEMPLATE.encode()).hexdigest()
 
 
+def _render_brand_guidance_section(guidance: dict | None) -> str:
+    """Return a formatted BRAND GUIDANCE block, or '' when guidance is empty.
+
+    Empty by default so behaviour and content_sha256 of existing prompts are
+    preserved when the optional brand_guidance.yaml is not present.
+    """
+    if not guidance:
+        return ""
+
+    lines: list[str] = ["", "BRAND GUIDANCE (authoritative — overrides defaults):"]
+
+    brand_name = guidance.get("brand_name")
+    if brand_name:
+        lines.append(f"Brand: {brand_name}")
+
+    positioning = guidance.get("positioning")
+    if positioning:
+        lines.append(f"Positioning:\n{positioning.strip()}")
+
+    must_avoid = guidance.get("must_avoid") or []
+    if must_avoid:
+        lines.append("MUST AVOID:")
+        lines.extend(f"  - {rule}" for rule in must_avoid)
+
+    should_do = guidance.get("should_do") or []
+    if should_do:
+        lines.append("SHOULD DO:")
+        lines.extend(f"  - {rule}" for rule in should_do)
+
+    continuity = guidance.get("continuity") or []
+    if continuity:
+        lines.append("CONTINUITY (apply across all clips of one video):")
+        lines.extend(f"  - {rule}" for rule in continuity)
+
+    return "\n".join(lines) + "\n"
+
+
 def render(
     brief: ProductBrief,
     talent_id: str,
@@ -62,6 +99,7 @@ def render(
     other_tones: list[str],
     clip_count: int,
     lifestyle_context: str,
+    brand_guidance: dict | None = None,
 ) -> str:
     """Render the director prompt by substituting all template placeholders.
 
@@ -94,4 +132,5 @@ def render(
         tone=tone,
         other_tones=other_tones_str,
         clip_count=clip_count,
+        brand_guidance_section=_render_brand_guidance_section(brand_guidance),
     )

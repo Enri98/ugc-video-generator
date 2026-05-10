@@ -80,7 +80,7 @@ class TestAnalystModule:
 
 class TestDirectorModuleConstants:
     def test_version_present(self) -> None:
-        assert director.VERSION == "1.0.0"
+        assert director.VERSION == "1.1.0"
 
     def test_template_non_empty(self) -> None:
         assert director.TEMPLATE.strip()
@@ -190,3 +190,33 @@ class TestDirectorRender:
         # Match {word} patterns — legitimate ones should all be substituted
         leftover = re.findall(r"\{[a-z_]+\}", result)
         assert leftover == [], f"Unreplaced placeholders found: {leftover}"
+
+    def test_brand_guidance_absent_by_default(self) -> None:
+        """Without brand_guidance, no BRAND GUIDANCE section appears."""
+        result = self._render_spec0()
+        assert "BRAND GUIDANCE" not in result
+
+    def test_brand_guidance_section_rendered_when_supplied(self) -> None:
+        """Supplying brand_guidance injects positioning, must_avoid, should_do."""
+        from ugc_pipeline.utils.config import get_talent_descriptor
+
+        brief = _make_brief()
+        guidance = {
+            "positioning": "Calm, conversational introduction of a closed product.",
+            "must_avoid": ["Do NOT unbox the product."],
+            "should_do": ["Hold the closed package and speak about it."],
+        }
+        result = director.render(
+            brief=brief,
+            talent_id="talent_02",
+            talent_descriptor=get_talent_descriptor("talent_02", _TALENT_POOL),
+            tone=TONES[0],
+            other_tones=[t for t in TONES if t != TONES[0]],
+            clip_count=2,
+            lifestyle_context=brief.lifestyle_contexts[0],
+            brand_guidance=guidance,
+        )
+        assert "BRAND GUIDANCE" in result
+        assert "Calm, conversational introduction" in result
+        assert "Do NOT unbox the product." in result
+        assert "Hold the closed package and speak about it." in result
