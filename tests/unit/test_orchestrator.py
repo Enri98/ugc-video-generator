@@ -834,3 +834,146 @@ async def test_run_pipeline_accepts_valid_speaking_clip_index(
 
     # Pass empty image list — no actual work will be done after validation passes
     await run_pipeline([], ctx, run_state, per_video_max_usd=8.0, global_max_usd=50.0)
+
+
+# ---------------------------------------------------------------------------
+# _step_first_frame source product image reference tests (v1.3.0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_step_first_frame_passes_source_image_to_all_clips(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_step_first_frame reads brief.image_path and passes those bytes as source_image_bytes to every clip."""
+    # Write a fake source product image to disk so the orchestrator can read it
+    src_bytes = b"\xff\xd8\xff\xe0" + b"\xAB" * 60  # minimal JPEG-like bytes
+    source_image_path = tmp_path / "product.jpg"
+    source_image_path.write_bytes(src_bytes)
+
+    clip0_png = b"\x89PNG\r\n\x1a\n" + b"\xAA" * 80
+    clip1_png = b"\x89PNG\r\n\x1a\n" + b"\xBB" * 80
+    clip2_png = b"\x89PNG\r\n\x1a\n" + b"\xCC" * 80
+
+    nb_client = MagicMock()
+    nb_client.generate_image = AsyncMock(
+        side_effect=[
+            NanoBananaResult(png_bytes=clip0_png),
+            NanoBananaResult(png_bytes=clip1_png),
+            NanoBananaResult(png_bytes=clip2_png),
+        ]
+    )
+
+    from ugc_pipeline.orchestrator import _step_first_frame
+
+    # Build a brief pointing at the on-disk source image
+    product_id = "src_ref_test_product"
+    spec = _video_spec(product_id, spec_index=0, clip_count=3)
+    brief = ProductBrief(
+        product_id=product_id,
+        image_path=str(source_image_path),
+        shape="cylindrical mug",
+        dominant_colours=["#FFFFFF"],
+        packaging_style="plain ceramic",
+        inferred_category="kitchenware",
+        lifestyle_contexts=["morning", "desk", "outdoor"],
+        created_at=datetime.now(timezone.utc),
+    )
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir(parents=True, exist_ok=True)
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    video_state = VideoState(
+        video_id=spec.video_id,
+        product_id=product_id,
+        spec_index=0,
+    )
+    run_state = _run_state()
+
+    save_product_brief(brief, root=state_root)
+    save_video_spec(spec, root=state_root)
+    save_video_state(video_state, root=state_root)
+    save_run_state(run_state, root=state_root)
+
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+
+    await _step_first_frame(video_state, spec, brief, run_state, ctx)
+
+    assert nb_client.generate_image.call_count == 3
+    calls = nb_client.generate_image.call_args_list
+
+    # All 3 clips must receive the source image bytes
+    for idx, call in enumerate(calls):
+        actual_src = call.kwargs.get("source_image_bytes")
+        assert actual_src == src_bytes, (
+            f"Call {idx}: expected source_image_bytes matching disk bytes, got {repr(actual_src[:20]) if actual_src else None!r}"
+        )
+
+    # Clip 0: no talent reference
+    assert calls[0].kwargs.get("reference_image_bytes") is None
+
+    # Clips 1 and 2: talent reference == clip 0's PNG bytes
+    assert calls[1].kwargs.get("reference_image_bytes") == clip0_png
+    assert calls[2].kwargs.get("reference_image_bytes") == clip0_png
+
+
+@pytest.mark.asyncio
+async def test_step_first_frame_source_image_missing_degrades_gracefully(
+    tmp_path: pathlib.Path,
+) -> None:
+    """If brief.image_path does not exist, _step_first_frame logs a warning and continues with source_image_bytes=None."""
+    nb_client = MagicMock()
+    nb_client.generate_image = AsyncMock(
+        return_value=NanoBananaResult(png_bytes=_FAKE_PNG)
+    )
+
+    from ugc_pipeline.orchestrator import _step_first_frame
+
+    product_id = "missing_src_product"
+    spec = _video_spec(product_id, spec_index=0, clip_count=2)
+    # Point image_path at a file that does not exist
+    brief = ProductBrief(
+        product_id=product_id,
+        image_path=str(tmp_path / "nonexistent_product.jpg"),
+        shape="cylinder",
+        dominant_colours=["#FFFFFF"],
+        packaging_style="plain",
+        inferred_category="lifestyle",
+        lifestyle_contexts=["morning", "desk", "outdoor"],
+        created_at=datetime.now(timezone.utc),
+    )
+
+    state_root = tmp_path / "state"
+    artifacts_root = tmp_path / "artifacts"
+    state_root.mkdir(parents=True, exist_ok=True)
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    video_state = VideoState(
+        video_id=spec.video_id,
+        product_id=product_id,
+        spec_index=0,
+    )
+    run_state = _run_state()
+
+    save_product_brief(brief, root=state_root)
+    save_video_spec(spec, root=state_root)
+    save_video_state(video_state, root=state_root)
+    save_run_state(run_state, root=state_root)
+
+    veo_client = _make_mock_veo(_FAKE_MP4)
+    flash_client = _make_mock_flash()
+    ctx = _make_context(state_root, artifacts_root, nb_client, veo_client, flash_client)
+
+    # Must not raise; degrades gracefully to source_image_bytes=None
+    await _step_first_frame(video_state, spec, brief, run_state, ctx)
+
+    # Both clips processed despite missing source image
+    assert nb_client.generate_image.call_count == 2
+
+    # All calls should have source_image_bytes=None (degraded path)
+    for call in nb_client.generate_image.call_args_list:
+        assert call.kwargs.get("source_image_bytes") is None

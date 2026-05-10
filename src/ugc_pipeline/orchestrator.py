@@ -207,12 +207,17 @@ async def _step_first_frame(
     on clip 0's PNG bytes as a visual reference. This keeps talent/lighting
     consistent across clips within a video.
 
+    The original source product image (brief.image_path) is passed as a visual
+    reference to EVERY clip so the model renders the actual product appearance
+    (including labels and packaging) rather than a generic shape.
+
     Edge cases handled:
     - Clip 0 absent from admitted batch (completed in a prior run): load its
       bytes from disk for the chain without re-generating.
     - dry_run: file does not exist on disk; skip read_bytes() for all clips.
     - Empty admitted batch: return immediately.
     - Single admitted clip (only clip 0): run it alone, no chaining.
+    - Source image missing or empty: degrade gracefully with a warning.
     """
     from ugc_pipeline.steps.first_frame import run_first_frame_for_clip
     from ugc_pipeline.utils.config import get_talent_descriptor
@@ -233,6 +238,27 @@ async def _step_first_frame(
     nb_model = str(nb_cfg.get("model", "gemini-2.5-flash-image"))
     nb_size_hint = nb_cfg.get("product_size_hint") or None  # None -> prompt default
 
+    # ------------------------------------------------------------------
+    # Read source product image bytes (one read per video — used as reference
+    # for all clips so the model renders the actual product, not a generic shape).
+    # ------------------------------------------------------------------
+    from ugc_pipeline.steps.first_frame import _mime_from_path
+
+    source_image_bytes: bytes | None = None
+    source_image_path = pathlib.Path(brief.image_path)
+    # Derive MIME type from the actual file extension so PNG sources are not
+    # misidentified as JPEG (matches the defensive pattern from the analyst step).
+    source_image_mime_type: str = _mime_from_path(source_image_path)
+    if not ctx.dry_run:
+        if source_image_path.exists() and source_image_path.stat().st_size > 0:
+            source_image_bytes = source_image_path.read_bytes()
+        else:
+            log.warning(
+                "first_frame_source_image_missing",
+                video_id=video_state.video_id,
+                path=str(source_image_path),
+            )
+
     common_kwargs: dict = dict(
         spec=spec,
         brief=brief,
@@ -246,6 +272,8 @@ async def _step_first_frame(
         dry_run=ctx.dry_run,
         model=nb_model,
         product_size_hint=nb_size_hint,
+        source_image_bytes=source_image_bytes,
+        source_image_mime_type=source_image_mime_type,
     )
 
     # ------------------------------------------------------------------
@@ -286,6 +314,7 @@ async def _step_first_frame(
         clip_count=len(indices_to_run_in_parallel),
         reference_source="clip_0",
         reference_available=clip0_bytes is not None,
+        source_image_available=source_image_bytes is not None,
         video_id=video_state.video_id,
     )
 

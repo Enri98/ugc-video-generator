@@ -757,6 +757,10 @@ class _DefaultVeoClient:
         from google.genai import types  # type: ignore[import-untyped]
 
         image = types.Image(image_bytes=image_bytes, mime_type="image/png")
+        # enhance_prompt intentionally unset — Veo 3.x rejects enhance_prompt=False
+        # with INVALID_ARGUMENT (code 3, "Veo 3 prompt enhancement cannot be disabled").
+        # The structured SCENE/AUDIO prompt may be rewritten by Veo's prompt enhancer
+        # at request time. If quality drifts, switch model or accept the rewrite.
         config = types.GenerateVideosConfig(
             aspect_ratio=self._aspect_ratio,
             resolution=self._resolution,
@@ -764,7 +768,6 @@ class _DefaultVeoClient:
             duration_seconds=self._duration_seconds,
             person_generation=self._person_generation,
             generate_audio=self._generate_audio,
-            enhance_prompt=False,
         )
         operation = await self._client.aio.models.generate_videos(
             model=model or self._model,

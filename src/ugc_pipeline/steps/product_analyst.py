@@ -367,7 +367,7 @@ async def run_product_analyst(
     brief = brief.model_copy(
         update={
             "product_id": product_id,
-            "image_path": str(image_path),
+            "image_path": str(image_path.resolve()),  # always absolute — matches defensive pattern from artifact paths
             "product_name": derive_product_name(filename, brand_name, variant_suffix_pattern=variant_suffix_pattern),
             "created_at": datetime.now(timezone.utc),
         }

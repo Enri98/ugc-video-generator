@@ -1154,12 +1154,15 @@ async def test_safety_retry_flash_structure_lost_falls_back(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 16 — _DefaultVeoClient passes generate_audio and enhance_prompt=False
+# Test 16 — _DefaultVeoClient passes generate_audio and does NOT set enhance_prompt
 # ---------------------------------------------------------------------------
 
 
 def test_default_veo_client_passes_generate_audio_to_config():
-    """GenerateVideosConfig must receive generate_audio=True and enhance_prompt=False."""
+    """GenerateVideosConfig must receive generate_audio=True and must NOT set enhance_prompt.
+
+    Veo 3.x rejects enhance_prompt=False with INVALID_ARGUMENT (code 3).
+    """
     from unittest.mock import MagicMock, patch
 
     captured_configs: list = []
@@ -1201,7 +1204,10 @@ def test_default_veo_client_passes_generate_audio_to_config():
     assert len(captured_configs) >= 1
     cfg_kwargs = captured_configs[0]
     assert cfg_kwargs.get("generate_audio") is True
-    assert cfg_kwargs.get("enhance_prompt") is False
+    assert "enhance_prompt" not in cfg_kwargs, (
+        "enhance_prompt must not be passed to GenerateVideosConfig — "
+        "Veo 3.x rejects enhance_prompt=False with INVALID_ARGUMENT (code 3)."
+    )
 
 
 # ---------------------------------------------------------------------------

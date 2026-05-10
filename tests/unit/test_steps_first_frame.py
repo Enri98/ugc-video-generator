@@ -19,11 +19,12 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from ugc_pipeline.models import ProductBrief, RunState, VideoSpec, VideoState
-from ugc_pipeline.prompts.first_frame import REFERENCE_PREAMBLE
+from ugc_pipeline.prompts.first_frame import REFERENCE_PREAMBLE, SOURCE_REFERENCE_PREAMBLE
 from ugc_pipeline.steps.first_frame import (
     NanoBananaGenerationError,
     NanoBananaResult,
     NanoBananaSafetyError,
+    _build_generate_image_contents,
     estimate_first_frame_cost_usd,
     run_first_frame_for_clip,
     run_first_frames,
@@ -594,3 +595,333 @@ async def test_safety_retry_keeps_reference_image(tmp_path: pathlib.Path) -> Non
     assert REFERENCE_PREAMBLE in retry_prompt, (
         f"Expected REFERENCE_PREAMBLE in softened retry prompt; got: {retry_prompt[:200]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Source product image reference tests (v1.3.0)
+# ---------------------------------------------------------------------------
+
+
+_FAKE_SRC = b"\xff\xd8\xff\xe0" + b"\xAA" * 80  # minimal JPEG-like header
+
+
+@pytest.mark.asyncio
+async def test_run_first_frame_for_clip_passes_source_bytes(tmp_path: pathlib.Path) -> None:
+    """When source_image_bytes is supplied, generate_image receives it."""
+    spec = _make_spec(clip_count=2)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+    client = _make_mock_client()
+
+    src_bytes = _FAKE_SRC
+
+    await run_first_frame_for_clip(
+        spec=spec,
+        brief=brief,
+        clip_index=0,
+        talent_descriptor="woman, late 20s, relaxed aesthetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+        source_image_bytes=src_bytes,
+    )
+
+    client.generate_image.assert_awaited_once()
+    call_kwargs = client.generate_image.await_args.kwargs
+    assert call_kwargs["source_image_bytes"] == src_bytes
+
+
+@pytest.mark.asyncio
+async def test_run_first_frame_for_clip_clip0_source_only_no_talent_ref(tmp_path: pathlib.Path) -> None:
+    """Clip 0 with source_image_bytes only: prompt uses SOURCE_REFERENCE_PREAMBLE, not REFERENCE_PREAMBLE."""
+    spec = _make_spec(clip_count=2)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+    client = _make_mock_client()
+
+    await run_first_frame_for_clip(
+        spec=spec,
+        brief=brief,
+        clip_index=0,
+        talent_descriptor="man, early 30s, energetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+        source_image_bytes=_FAKE_SRC,
+        reference_image_bytes=None,
+    )
+
+    call_kwargs = client.generate_image.await_args.kwargs
+    prompt = call_kwargs["prompt"]
+    assert SOURCE_REFERENCE_PREAMBLE in prompt, (
+        f"Expected SOURCE_REFERENCE_PREAMBLE in clip-0 prompt; got: {prompt[:200]!r}"
+    )
+    assert REFERENCE_PREAMBLE not in prompt, (
+        "Clip 0 should NOT have REFERENCE_PREAMBLE (talent reference) in prompt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_first_frame_for_clip_clip1_source_plus_talent(tmp_path: pathlib.Path) -> None:
+    """Clip 1 with both source and talent reference: prompt has both preambles."""
+    spec = _make_spec(clip_count=2)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+    client = _make_mock_client()
+
+    ref_bytes = _FAKE_PNG
+    src_bytes = _FAKE_SRC
+
+    await run_first_frame_for_clip(
+        spec=spec,
+        brief=brief,
+        clip_index=1,
+        talent_descriptor="woman, late 20s, relaxed aesthetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+        source_image_bytes=src_bytes,
+        reference_image_bytes=ref_bytes,
+    )
+
+    call_kwargs = client.generate_image.await_args.kwargs
+    prompt = call_kwargs["prompt"]
+    assert SOURCE_REFERENCE_PREAMBLE in prompt, (
+        f"Expected SOURCE_REFERENCE_PREAMBLE in clip-1 prompt; got: {prompt[:200]!r}"
+    )
+    assert REFERENCE_PREAMBLE in prompt, (
+        f"Expected REFERENCE_PREAMBLE in clip-1 prompt; got: {prompt[:200]!r}"
+    )
+    # Source preamble must come before talent preamble
+    assert prompt.index(SOURCE_REFERENCE_PREAMBLE) < prompt.index(REFERENCE_PREAMBLE)
+
+
+@pytest.mark.asyncio
+async def test_run_first_frames_passes_source_to_all_clips(tmp_path: pathlib.Path) -> None:
+    """run_first_frames passes source_image_bytes to all clip calls."""
+    clip_count = 3
+    spec = _make_spec(clip_count=clip_count)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+    client = _make_mock_client(png_bytes=_FAKE_PNG)
+
+    src_bytes = _FAKE_SRC
+
+    await run_first_frames(
+        spec=spec,
+        brief=brief,
+        talent_descriptor="man, early 30s, energetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+        source_image_bytes=src_bytes,
+    )
+
+    assert client.generate_image.await_count == clip_count
+    calls = client.generate_image.await_args_list
+
+    # All 3 calls must receive the source bytes
+    for idx, call in enumerate(calls):
+        assert call.kwargs.get("source_image_bytes") == src_bytes, (
+            f"Call {idx} should have source_image_bytes, got {call.kwargs.get('source_image_bytes')!r}"
+        )
+
+    # Clip 0: no talent reference
+    assert calls[0].kwargs["reference_image_bytes"] is None
+
+    # Clips 1 and 2: talent reference == clip 0's bytes (_FAKE_PNG)
+    assert calls[1].kwargs["reference_image_bytes"] == _FAKE_PNG
+    assert calls[2].kwargs["reference_image_bytes"] == _FAKE_PNG
+
+
+@pytest.mark.asyncio
+async def test_run_first_frames_no_source_bytes_still_works(tmp_path: pathlib.Path) -> None:
+    """run_first_frames with source_image_bytes=None falls back to text-only for clip 0."""
+    clip_count = 2
+    spec = _make_spec(clip_count=clip_count)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+    client = _make_mock_client()
+
+    paths = await run_first_frames(
+        spec=spec,
+        brief=brief,
+        talent_descriptor="man, early 30s, energetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+        source_image_bytes=None,
+    )
+
+    assert len(paths) == clip_count
+    assert client.generate_image.await_count == clip_count
+
+    calls = client.generate_image.await_args_list
+    # No source bytes in any call
+    for call in calls:
+        assert call.kwargs.get("source_image_bytes") is None
+
+
+@pytest.mark.asyncio
+async def test_safety_retry_clip0_with_source_keeps_source_bytes(tmp_path: pathlib.Path) -> None:
+    """Safety retry for clip 0 with source_image_bytes keeps source bytes and uses source-softened prompt."""
+    spec = _make_spec(clip_count=2)
+    brief = _make_brief()
+    video_state = _make_video_state(spec)
+    run_state = _make_run_state()
+
+    client = MagicMock()
+    client.generate_image = AsyncMock(
+        side_effect=[
+            NanoBananaSafetyError("safety block"),
+            NanoBananaResult(png_bytes=_FAKE_PNG, model="gemini-3-flash-image"),
+        ]
+    )
+
+    await run_first_frame_for_clip(
+        spec=spec,
+        brief=brief,
+        clip_index=0,
+        talent_descriptor="woman, late 20s, relaxed aesthetic",
+        client=client,
+        video_state=video_state,
+        run_state=run_state,
+        state_root=tmp_path / "state",
+        artifacts_root=tmp_path / "artifacts",
+        source_image_bytes=_FAKE_SRC,
+        reference_image_bytes=None,
+    )
+
+    assert client.generate_image.await_count == 2
+    retry_kwargs = client.generate_image.await_args_list[1].kwargs
+
+    # Source bytes preserved on retry
+    assert retry_kwargs["source_image_bytes"] == _FAKE_SRC
+    # No talent reference (clip 0)
+    assert retry_kwargs["reference_image_bytes"] is None
+
+    # Prompt is softened+source variant — contains SOURCE_REFERENCE_PREAMBLE
+    retry_prompt = retry_kwargs["prompt"]
+    assert SOURCE_REFERENCE_PREAMBLE in retry_prompt, (
+        f"Expected SOURCE_REFERENCE_PREAMBLE in softened retry prompt; got: {retry_prompt[:200]!r}"
+    )
+    assert REFERENCE_PREAMBLE not in retry_prompt
+
+
+# ---------------------------------------------------------------------------
+# _build_generate_image_contents — pure builder function tests (Bug #1 regression)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildGenerateImageContents:
+    """Unit tests for the pure _build_generate_image_contents builder.
+
+    These tests exercise the MIME-type wiring without constructing a real
+    google.genai Client (which requires valid credentials). They would have
+    caught Bug #1 (source MIME hardcoded to image/jpeg) at code-review time.
+    """
+
+    _FAKE_SRC_PNG = b"\x89PNG\r\n\x1a\n" + b"\xAA" * 20
+    _FAKE_SRC_JPEG = b"\xff\xd8\xff\xe0" + b"\xBB" * 20
+    _FAKE_REF_PNG = b"\x89PNG\r\n\x1a\n" + b"\xCC" * 20
+    _PROMPT = "Generate a portrait."
+
+    def test_build_kwargs_source_png_mime(self) -> None:
+        """Source bytes with mime_type='image/png' produce inline_data with image/png."""
+        contents = _build_generate_image_contents(
+            prompt=self._PROMPT,
+            source_image_bytes=self._FAKE_SRC_PNG,
+            source_image_mime_type="image/png",
+            reference_image_bytes=None,
+        )
+        parts = contents[0]["parts"]
+        # First part is the source inline_data
+        assert parts[0]["inline_data"]["mime_type"] == "image/png", (
+            f"Expected image/png for source, got {parts[0]['inline_data']['mime_type']!r}"
+        )
+
+    def test_build_kwargs_source_jpeg_mime(self) -> None:
+        """Source bytes with mime_type='image/jpeg' produce inline_data with image/jpeg."""
+        contents = _build_generate_image_contents(
+            prompt=self._PROMPT,
+            source_image_bytes=self._FAKE_SRC_JPEG,
+            source_image_mime_type="image/jpeg",
+            reference_image_bytes=None,
+        )
+        parts = contents[0]["parts"]
+        assert parts[0]["inline_data"]["mime_type"] == "image/jpeg", (
+            f"Expected image/jpeg for source, got {parts[0]['inline_data']['mime_type']!r}"
+        )
+
+    def test_build_kwargs_only_text_when_no_refs(self) -> None:
+        """When no source or reference bytes are given, parts has only the text part."""
+        contents = _build_generate_image_contents(
+            prompt=self._PROMPT,
+            source_image_bytes=None,
+            source_image_mime_type="image/png",
+            reference_image_bytes=None,
+        )
+        parts = contents[0]["parts"]
+        assert len(parts) == 1
+        assert "text" in parts[0]
+        assert parts[0]["text"] == self._PROMPT
+
+    def test_build_kwargs_source_only(self) -> None:
+        """With source only: source inline_data is first, text prompt is second."""
+        contents = _build_generate_image_contents(
+            prompt=self._PROMPT,
+            source_image_bytes=self._FAKE_SRC_PNG,
+            source_image_mime_type="image/png",
+            reference_image_bytes=None,
+        )
+        parts = contents[0]["parts"]
+        assert len(parts) == 2
+        assert "inline_data" in parts[0], "First part must be source inline_data"
+        assert "text" in parts[1], "Second part must be the text prompt"
+
+    def test_build_kwargs_source_and_talent(self) -> None:
+        """With source + talent reference: source first, talent second, text third."""
+        contents = _build_generate_image_contents(
+            prompt=self._PROMPT,
+            source_image_bytes=self._FAKE_SRC_PNG,
+            source_image_mime_type="image/png",
+            reference_image_bytes=self._FAKE_REF_PNG,
+        )
+        parts = contents[0]["parts"]
+        assert len(parts) == 3
+        # Source inline_data (image/png from source_image_mime_type)
+        assert parts[0]["inline_data"]["mime_type"] == "image/png"
+        # Talent reference inline_data (always image/png — Nano Banana output)
+        assert parts[1]["inline_data"]["mime_type"] == "image/png"
+        # Text prompt
+        assert "text" in parts[2]
+        assert parts[2]["text"] == self._PROMPT
+
+    def test_build_kwargs_talent_reference_always_png(self) -> None:
+        """Talent reference image is always typed as image/png regardless of source MIME."""
+        contents = _build_generate_image_contents(
+            prompt=self._PROMPT,
+            source_image_bytes=self._FAKE_SRC_JPEG,
+            source_image_mime_type="image/jpeg",
+            reference_image_bytes=self._FAKE_REF_PNG,
+        )
+        parts = contents[0]["parts"]
+        # Source is JPEG
+        assert parts[0]["inline_data"]["mime_type"] == "image/jpeg"
+        # Talent ref is always PNG
+        assert parts[1]["inline_data"]["mime_type"] == "image/png"

@@ -13,15 +13,31 @@ import hashlib
 
 from ugc_pipeline.models import ProductBrief, VideoSpec
 
-VERSION = "1.2.0"
+VERSION = "1.3.1"
+
+SOURCE_REFERENCE_PREAMBLE = (
+    "SOURCE PRODUCT IMAGE PROVIDED: A photo of the actual product is attached"
+    " as the first input. This is the AUTHORITATIVE source for the product's"
+    " appearance: shape, colour, packaging, and any printed text or labels"
+    " visible on it. Reproduce these faithfully — the product on screen must"
+    " be recognisable as the same item shown in the reference."
+)
 
 REFERENCE_PREAMBLE = (
-    "REFERENCE IMAGE PROVIDED: A reference image of the same talent and the same "
-    "product is attached as the first input. Use it as the authoritative source for: "
-    "the person's face, hair, body type, wardrobe, and the product's shape/colour/"
-    "packaging. Only the scene, pose, framing, and lighting may change between this "
-    "image and the reference — the identity of the person and product MUST be "
-    "preserved exactly."
+    "TALENT REFERENCE IMAGE PROVIDED: An image of the same talent and the"
+    " same product is attached as a reference input. Use it as the"
+    " authoritative source for: the person's face, hair, body type, and"
+    " wardrobe. Only the scene, pose, framing, and lighting may change"
+    " between this image and the reference — the identity of the person"
+    " MUST be preserved exactly."
+)
+
+# Used only by render_with_source_and_talent — states input ordering when BOTH
+# source product AND talent reference images are attached simultaneously.
+_INPUT_ORDER_NOTE = (
+    "INPUT ORDER NOTE: Two reference images are attached. The FIRST input is"
+    " the source product image (authority for product appearance). The SECOND"
+    " input is the talent reference image (authority for talent identity)."
 )
 
 TEMPLATE = """\
@@ -40,7 +56,6 @@ SCENE: {scene_setting}
 {colour_palette}
 
 STYLE: {visual_style_notes}
-No text, watermarks, logos, or brand identifiers in the image.
 
 This image will be used as the first frame of a video clip. {forward_motion_hint}\
 """
@@ -135,7 +150,7 @@ def _soften(body: str, *, preamble: str = "") -> str:
     Strips blocklist words from *body* only, then returns:
         ``_SAFETY_PREAMBLE + preamble + body_softened``
 
-    The *preamble* argument (e.g. ``REFERENCE_PREAMBLE + "\\n\\n"``) is
+    The *preamble* argument (e.g. ``SOURCE_REFERENCE_PREAMBLE + "\\n\\n"``) is
     inserted verbatim between the safety preamble and the softened body —
     blocklist replacement is deliberately NOT applied to it. Rule-based only —
     no LLM involvement.
@@ -175,36 +190,15 @@ def render_with_reference(
     talent_descriptor: str,
     product_size_hint: str = _DEFAULT_SIZE_HINT,
 ) -> str:
-    """Render the first-frame prompt for clip_index, prepending the reference-image preamble.
+    """Render the first-frame prompt for clip_index, prepending the talent reference preamble.
+
+    Kept for backward compatibility. For new code, prefer render_with_source()
+    or render_with_source_and_talent().
 
     For clip i ≥ 1, the caller should attach the clip-0 PNG bytes as the first
     image input alongside this prompt. The preamble instructs the model to anchor
     person identity and product appearance on the reference image; only scene,
     pose, framing, and lighting may vary.
-
-    For clip 0 the caller should still use the plain ``render()`` function (no
-    reference image exists yet). This function does not enforce that constraint
-    in code — the caller is responsible for the clip-0 / clip-i distinction.
-
-    Parameters
-    ----------
-    spec:
-        The VideoSpec for the current video.
-    brief:
-        The ProductBrief describing the product.
-    clip_index:
-        Which clip (0-based) this first frame is for.
-    talent_descriptor:
-        Human-readable description of the talent (gender, age, aesthetic, etc.)
-        resolved from the talent pool.
-    product_size_hint:
-        Optional override for the product scale description.
-
-    Returns
-    -------
-    str
-        The fully rendered image-generation prompt with the REFERENCE_PREAMBLE
-        prepended.
     """
     base_prompt = render(spec, brief, clip_index, talent_descriptor, product_size_hint)
     return REFERENCE_PREAMBLE + "\n\n" + base_prompt
@@ -217,16 +211,34 @@ def render_with_reference_softened(
     talent_descriptor: str,
     product_size_hint: str = _DEFAULT_SIZE_HINT,
 ) -> str:
-    """Return a softened, reference-anchored variant of the first-frame prompt.
+    """Return a softened, talent-reference-anchored variant of the first-frame prompt.
 
-    Combines ``render_with_reference()`` with the heuristic safety softening
-    applied by ``render_softened()``. The output order is: safety preamble
-    first, then the reference instruction, then the base prompt body.
+    Kept for backward compatibility. Combines render_with_reference() with
+    heuristic safety softening. Output order: safety preamble, reference
+    instruction, softened body.
+    """
+    base_prompt = render(spec, brief, clip_index, talent_descriptor, product_size_hint)
+    return _soften(base_prompt, preamble=REFERENCE_PREAMBLE + "\n\n")
 
-    The reference instruction (``REFERENCE_PREAMBLE``) is left intact — only
-    the body of the rendered prompt is softened (blocklist words stripped).
-    This guarantees that identity-preservation instructions cannot be
-    accidentally mangled by future blocklist changes.
+
+# ---------------------------------------------------------------------------
+# New dual-reference render functions (v1.3.0)
+# ---------------------------------------------------------------------------
+
+
+def render_with_source(
+    spec: VideoSpec,
+    brief: ProductBrief,
+    clip_index: int,
+    talent_descriptor: str,
+    *,
+    product_size_hint: str = _DEFAULT_SIZE_HINT,
+) -> str:
+    """Render with source product reference only (clip 0).
+
+    Prepends SOURCE_REFERENCE_PREAMBLE so the model anchors on the actual
+    product's appearance (labels, colour, shape) from the attached image.
+    No talent reference is used — this is the clip-0 variant.
 
     Parameters
     ----------
@@ -237,14 +249,138 @@ def render_with_reference_softened(
     clip_index:
         Which clip (0-based) this first frame is for.
     talent_descriptor:
-        Human-readable description of the talent resolved from the talent pool.
+        Human-readable talent description resolved from the talent pool.
     product_size_hint:
         Optional override for the product scale description.
 
     Returns
     -------
     str
-        The fully rendered, softened, reference-anchored prompt.
+        The fully rendered prompt with SOURCE_REFERENCE_PREAMBLE prepended.
     """
-    base_prompt = render(spec, brief, clip_index, talent_descriptor, product_size_hint)
-    return _soften(base_prompt, preamble=REFERENCE_PREAMBLE + "\n\n")
+    base = render(spec, brief, clip_index, talent_descriptor, product_size_hint=product_size_hint)
+    return SOURCE_REFERENCE_PREAMBLE + "\n\n" + base
+
+
+def render_with_source_and_talent(
+    spec: VideoSpec,
+    brief: ProductBrief,
+    clip_index: int,
+    talent_descriptor: str,
+    *,
+    product_size_hint: str = _DEFAULT_SIZE_HINT,
+) -> str:
+    """Render with both source product AND talent reference (clip ≥ 1).
+
+    Prepends SOURCE_REFERENCE_PREAMBLE (for the first attached image) then
+    REFERENCE_PREAMBLE (for the second attached image — clip 0's PNG), then
+    the rendered base prompt body.
+
+    Parameters
+    ----------
+    spec:
+        The VideoSpec for the current video.
+    brief:
+        The ProductBrief describing the product.
+    clip_index:
+        Which clip (0-based) this first frame is for.
+    talent_descriptor:
+        Human-readable talent description resolved from the talent pool.
+    product_size_hint:
+        Optional override for the product scale description.
+
+    Returns
+    -------
+    str
+        The fully rendered prompt with both preambles prepended.
+    """
+    base = render(spec, brief, clip_index, talent_descriptor, product_size_hint=product_size_hint)
+    return (
+        _INPUT_ORDER_NOTE
+        + "\n\n"
+        + SOURCE_REFERENCE_PREAMBLE
+        + "\n\n"
+        + REFERENCE_PREAMBLE
+        + "\n\n"
+        + base
+    )
+
+
+def render_with_source_softened(
+    spec: VideoSpec,
+    brief: ProductBrief,
+    clip_index: int,
+    talent_descriptor: str,
+    *,
+    product_size_hint: str = _DEFAULT_SIZE_HINT,
+) -> str:
+    """Softened variant of render_with_source (clip 0 safety retry).
+
+    SOURCE_REFERENCE_PREAMBLE is preserved verbatim; only the body is softened.
+    Output order: safety preamble → source preamble → softened body.
+
+    Parameters
+    ----------
+    spec:
+        The VideoSpec for the current video.
+    brief:
+        The ProductBrief describing the product.
+    clip_index:
+        Which clip (0-based) this first frame is for.
+    talent_descriptor:
+        Human-readable talent description resolved from the talent pool.
+    product_size_hint:
+        Optional override for the product scale description.
+
+    Returns
+    -------
+    str
+        The fully rendered, softened, source-reference-anchored prompt.
+    """
+    base = render(spec, brief, clip_index, talent_descriptor, product_size_hint=product_size_hint)
+    return _soften(base, preamble=SOURCE_REFERENCE_PREAMBLE + "\n\n")
+
+
+def render_with_source_and_talent_softened(
+    spec: VideoSpec,
+    brief: ProductBrief,
+    clip_index: int,
+    talent_descriptor: str,
+    *,
+    product_size_hint: str = _DEFAULT_SIZE_HINT,
+) -> str:
+    """Softened variant of render_with_source_and_talent (clip ≥1 safety retry).
+
+    Both preambles are preserved verbatim; only the body is softened.
+    Output order: safety preamble → source preamble → talent preamble → softened body.
+
+    Parameters
+    ----------
+    spec:
+        The VideoSpec for the current video.
+    brief:
+        The ProductBrief describing the product.
+    clip_index:
+        Which clip (0-based) this first frame is for.
+    talent_descriptor:
+        Human-readable talent description resolved from the talent pool.
+    product_size_hint:
+        Optional override for the product scale description.
+
+    Returns
+    -------
+    str
+        The fully rendered, softened, dual-reference-anchored prompt.
+    """
+    base = render(spec, brief, clip_index, talent_descriptor, product_size_hint=product_size_hint)
+    return _soften(
+        base,
+        preamble=(
+            _INPUT_ORDER_NOTE
+            + "\n\n"
+            + SOURCE_REFERENCE_PREAMBLE
+            + "\n\n"
+            + REFERENCE_PREAMBLE
+            + "\n\n"
+        ),
+    )

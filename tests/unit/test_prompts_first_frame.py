@@ -1,7 +1,9 @@
 """Unit tests for ugc_pipeline.prompts.first_frame.
 
 Covers VERSION, TEMPLATE, CONTENT_SHA256, render(), render_softened(),
-render_with_reference(), and render_with_reference_softened().
+render_with_reference(), render_with_reference_softened(),
+render_with_source(), render_with_source_softened(),
+render_with_source_and_talent(), render_with_source_and_talent_softened().
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from ugc_pipeline.prompts import first_frame
 from ugc_pipeline.prompts.first_frame import (
     CONTENT_SHA256,
     REFERENCE_PREAMBLE,
+    SOURCE_REFERENCE_PREAMBLE,
     TEMPLATE,
     VERSION,
     _SAFETY_PREAMBLE,
@@ -23,6 +26,10 @@ from ugc_pipeline.prompts.first_frame import (
     render_softened,
     render_with_reference,
     render_with_reference_softened,
+    render_with_source,
+    render_with_source_and_talent,
+    render_with_source_and_talent_softened,
+    render_with_source_softened,
 )
 
 
@@ -86,7 +93,7 @@ _TALENT_DESCRIPTOR = "woman, late 20s, natural relaxed aesthetic, warm camera pr
 
 class TestModuleConstants:
     def test_version_present(self) -> None:
-        assert VERSION == "1.2.0"
+        assert VERSION == "1.3.1"
 
     def test_template_non_empty(self) -> None:
         assert TEMPLATE.strip()
@@ -101,6 +108,31 @@ class TestModuleConstants:
     def test_reference_preamble_mentions_identity(self) -> None:
         # Must convey identity-preservation instruction.
         assert "identity" in REFERENCE_PREAMBLE.lower() or "preserved" in REFERENCE_PREAMBLE.lower()
+
+    def test_reference_preamble_does_not_claim_second_input(self) -> None:
+        """REFERENCE_PREAMBLE must be position-neutral — no 'second input' claim.
+
+        The preamble is used both when only one image is attached (degraded path)
+        and when two images are attached (dual-reference path). Claiming 'second
+        input' in the shared constant would mislead the model on the degraded path.
+        """
+        assert "second input" not in REFERENCE_PREAMBLE.lower(), (
+            "REFERENCE_PREAMBLE must not claim a specific input position; "
+            "that ordering hint belongs only in render_with_source_and_talent."
+        )
+
+    def test_source_reference_preamble_constant_present(self) -> None:
+        """SOURCE_REFERENCE_PREAMBLE must exist and be non-empty."""
+        assert SOURCE_REFERENCE_PREAMBLE.strip()
+
+    def test_source_reference_preamble_mentions_product(self) -> None:
+        """SOURCE_REFERENCE_PREAMBLE must mention 'product' (authoritative source instruction)."""
+        assert "product" in SOURCE_REFERENCE_PREAMBLE.lower()
+
+    def test_template_does_not_forbid_labels(self) -> None:
+        """TEMPLATE must NOT contain 'No text, watermarks, logos' — that line was removed in v1.3.0."""
+        assert "No text, watermarks, logos" not in TEMPLATE
+        assert "brand identifiers" not in TEMPLATE
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +188,7 @@ class TestRenderSoftened:
 
 
 # ---------------------------------------------------------------------------
-# render_with_reference()
+# render_with_reference()  (backward compat — talent-only)
 # ---------------------------------------------------------------------------
 
 
@@ -173,18 +205,15 @@ class TestRenderWithReference:
 
     def test_render_with_reference_includes_reference_preamble(self) -> None:
         result = self._rendered()
-        # At minimum the key identifying phrase must appear.
-        assert "REFERENCE IMAGE PROVIDED" in result
+        assert "TALENT REFERENCE IMAGE PROVIDED" in result
 
     def test_render_with_reference_preamble_substring_present(self) -> None:
         result = self._rendered()
-        # The constant itself must be a substring of the output.
         assert REFERENCE_PREAMBLE in result
 
     def test_render_with_reference_contains_same_body_text(self) -> None:
         result = self._rendered(clip_index=1)
         base = self._base(clip_index=1)
-        # The base prompt body must appear inside the reference-augmented prompt.
         assert base in result
 
     def test_render_with_reference_differs_from_render(self) -> None:
@@ -209,7 +238,7 @@ class TestRenderWithReference:
 
 
 # ---------------------------------------------------------------------------
-# render_with_reference_softened()
+# render_with_reference_softened()  (backward compat — talent-only)
 # ---------------------------------------------------------------------------
 
 
@@ -257,16 +286,14 @@ class TestRenderWithReferenceSoftened:
         This is the key regression test for Bug #2: _soften() must only strip
         blocklist words from the prompt *body*, never from REFERENCE_PREAMBLE.
         The injected blocklist contains words that appear verbatim in REFERENCE_PREAMBLE
-        ("REFERENCE", "image", "person"), so the old code (which applied stripping to
+        ("TALENT", "image", "person"), so the old code (which applied stripping to
         the entire concatenated string) would corrupt REFERENCE_PREAMBLE and this test
         would fail. After the fix, REFERENCE_PREAMBLE must appear verbatim in the result.
         """
         from unittest.mock import patch
 
         # Inject blocklist words that DO appear inside REFERENCE_PREAMBLE.
-        # "REFERENCE" is the first word of REFERENCE_PREAMBLE; "image" and "person"
-        # also appear inside it. The pre-fix code would strip these, corrupting the preamble.
-        adversarial_blocklist = ["REFERENCE", "image", "person"]
+        adversarial_blocklist = ["TALENT", "image", "person"]
 
         with patch.object(first_frame, "_SAFETY_BLOCKLIST", new=adversarial_blocklist):
             result = render_with_reference_softened(
@@ -277,4 +304,186 @@ class TestRenderWithReferenceSoftened:
         assert REFERENCE_PREAMBLE in result, (
             "REFERENCE_PREAMBLE was corrupted by blocklist stripping. "
             "The softening must only operate on the body, not the preamble."
+        )
+
+
+# ---------------------------------------------------------------------------
+# render_with_source() — clip 0: source product reference only
+# ---------------------------------------------------------------------------
+
+
+class TestRenderWithSource:
+    def _rendered(self, clip_index: int = 0) -> str:
+        return render_with_source(
+            _make_spec(), _make_brief(), clip_index=clip_index, talent_descriptor=_TALENT_DESCRIPTOR
+        )
+
+    def test_render_with_source_includes_source_preamble(self) -> None:
+        result = self._rendered()
+        assert SOURCE_REFERENCE_PREAMBLE in result
+
+    def test_render_with_source_does_not_include_talent_preamble(self) -> None:
+        """Clip 0 should have source reference but NOT the talent reference preamble."""
+        result = self._rendered()
+        assert REFERENCE_PREAMBLE not in result
+
+    def test_render_with_source_source_preamble_before_body(self) -> None:
+        result = self._rendered()
+        base = render(
+            _make_spec(), _make_brief(), clip_index=0, talent_descriptor=_TALENT_DESCRIPTOR
+        )
+        src_pos = result.index(SOURCE_REFERENCE_PREAMBLE)
+        body_pos = result.index(base)
+        assert src_pos < body_pos
+
+    def test_render_with_source_no_unreplaced_placeholders(self) -> None:
+        result = self._rendered()
+        leftover = re.findall(r"\{[a-z_]+\}", result)
+        assert leftover == [], f"Unreplaced placeholders found: {leftover}"
+
+    def test_render_with_source_contains_body_text(self) -> None:
+        result = self._rendered()
+        assert "cylindrical mug" in result
+        assert _TALENT_DESCRIPTOR in result
+
+
+# ---------------------------------------------------------------------------
+# render_with_source_and_talent() — clips ≥1: both preambles
+# ---------------------------------------------------------------------------
+
+
+class TestRenderWithSourceAndTalent:
+    def _rendered(self, clip_index: int = 1) -> str:
+        return render_with_source_and_talent(
+            _make_spec(), _make_brief(), clip_index=clip_index, talent_descriptor=_TALENT_DESCRIPTOR
+        )
+
+    def test_render_with_source_and_talent_includes_both_preambles(self) -> None:
+        result = self._rendered()
+        assert SOURCE_REFERENCE_PREAMBLE in result
+        assert REFERENCE_PREAMBLE in result
+
+    def test_render_with_source_and_talent_order(self) -> None:
+        """SOURCE_REFERENCE_PREAMBLE must come BEFORE REFERENCE_PREAMBLE in output."""
+        result = self._rendered()
+        src_pos = result.index(SOURCE_REFERENCE_PREAMBLE)
+        ref_pos = result.index(REFERENCE_PREAMBLE)
+        assert src_pos < ref_pos, (
+            f"Expected SOURCE_REFERENCE_PREAMBLE before REFERENCE_PREAMBLE, "
+            f"got positions {src_pos} and {ref_pos}"
+        )
+
+    def test_render_with_source_and_talent_no_unreplaced_placeholders(self) -> None:
+        result = self._rendered()
+        leftover = re.findall(r"\{[a-z_]+\}", result)
+        assert leftover == [], f"Unreplaced placeholders found: {leftover}"
+
+    def test_render_with_source_and_talent_contains_body_text(self) -> None:
+        result = self._rendered()
+        assert "cylindrical mug" in result
+        assert _TALENT_DESCRIPTOR in result
+
+    def test_render_with_source_and_talent_contains_input_order_note(self) -> None:
+        """Dual-reference output must include 'FIRST input' and 'SECOND input' ordering hints.
+
+        These appear in _INPUT_ORDER_NOTE which is prepended only by
+        render_with_source_and_talent — so the claim is accurate (two images ARE attached).
+        """
+        result = self._rendered()
+        assert "FIRST input" in result, (
+            "render_with_source_and_talent output must contain 'FIRST input' ordering hint"
+        )
+        assert "SECOND input" in result, (
+            "render_with_source_and_talent output must contain 'SECOND input' ordering hint"
+        )
+
+
+# ---------------------------------------------------------------------------
+# render_with_source_softened() — clip 0 safety retry
+# ---------------------------------------------------------------------------
+
+
+class TestRenderWithSourceSoftened:
+    def _rendered(self, clip_index: int = 0) -> str:
+        return render_with_source_softened(
+            _make_spec(), _make_brief(), clip_index=clip_index, talent_descriptor=_TALENT_DESCRIPTOR
+        )
+
+    def test_render_with_source_softened_starts_with_safety_preamble(self) -> None:
+        result = self._rendered()
+        assert result.startswith(_SAFETY_PREAMBLE)
+
+    def test_render_with_source_softened_preserves_source_preamble(self) -> None:
+        result = self._rendered()
+        assert SOURCE_REFERENCE_PREAMBLE in result
+
+    def test_render_with_source_softened_does_not_include_talent_preamble(self) -> None:
+        result = self._rendered()
+        assert REFERENCE_PREAMBLE not in result
+
+    def test_render_with_source_softened_order(self) -> None:
+        """Safety preamble must appear before source preamble in output."""
+        result = self._rendered()
+        safety_pos = result.index(_SAFETY_PREAMBLE)
+        src_pos = result.index(SOURCE_REFERENCE_PREAMBLE)
+        assert safety_pos < src_pos
+
+    def test_render_with_source_softened_no_unreplaced_placeholders(self) -> None:
+        result = self._rendered()
+        leftover = re.findall(r"\{[a-z_]+\}", result)
+        assert leftover == [], f"Unreplaced placeholders found: {leftover}"
+
+
+# ---------------------------------------------------------------------------
+# render_with_source_and_talent_softened() — clip ≥1 safety retry
+# ---------------------------------------------------------------------------
+
+
+class TestRenderWithSourceAndTalentSoftened:
+    def _rendered(self, clip_index: int = 1) -> str:
+        return render_with_source_and_talent_softened(
+            _make_spec(), _make_brief(), clip_index=clip_index, talent_descriptor=_TALENT_DESCRIPTOR
+        )
+
+    def test_render_with_source_and_talent_softened_starts_with_safety_preamble(self) -> None:
+        result = self._rendered()
+        assert result.startswith(_SAFETY_PREAMBLE)
+
+    def test_render_with_source_and_talent_softened_preserves_both_preambles(self) -> None:
+        """Softening must not strip SOURCE_REFERENCE_PREAMBLE or REFERENCE_PREAMBLE."""
+        result = self._rendered()
+        assert SOURCE_REFERENCE_PREAMBLE in result
+        assert REFERENCE_PREAMBLE in result
+
+    def test_render_with_source_and_talent_softened_order(self) -> None:
+        """Order: safety → source reference → talent reference → body."""
+        result = self._rendered()
+        safety_pos = result.index(_SAFETY_PREAMBLE)
+        src_pos = result.index(SOURCE_REFERENCE_PREAMBLE)
+        ref_pos = result.index(REFERENCE_PREAMBLE)
+        assert safety_pos < src_pos < ref_pos
+
+    def test_render_with_source_and_talent_softened_no_unreplaced_placeholders(self) -> None:
+        result = self._rendered()
+        leftover = re.findall(r"\{[a-z_]+\}", result)
+        assert leftover == [], f"Unreplaced placeholders found: {leftover}"
+
+    def test_render_with_source_and_talent_softened_preserves_preambles_with_adversarial_blocklist(
+        self,
+    ) -> None:
+        """Both preambles survive blocklist softening even when blocklist words appear in them."""
+        from unittest.mock import patch
+
+        adversarial_blocklist = ["SOURCE", "TALENT", "image", "product"]
+
+        with patch.object(first_frame, "_SAFETY_BLOCKLIST", new=adversarial_blocklist):
+            result = render_with_source_and_talent_softened(
+                _make_spec(), _make_brief(), clip_index=1, talent_descriptor=_TALENT_DESCRIPTOR
+            )
+
+        assert SOURCE_REFERENCE_PREAMBLE in result, (
+            "SOURCE_REFERENCE_PREAMBLE was corrupted by blocklist stripping."
+        )
+        assert REFERENCE_PREAMBLE in result, (
+            "REFERENCE_PREAMBLE was corrupted by blocklist stripping."
         )
