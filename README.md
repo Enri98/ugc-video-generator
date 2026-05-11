@@ -17,6 +17,8 @@ checkpointed to disk so any failure is resumable.
 
 For a design overview see [`ARCHITECTURE.md`](./ARCHITECTURE.md).
 
+![Pipeline diagram](img/ugc-diagramma.png)
+
 ## Stack
 
 - **Gemini 2.5 Pro** — product analysis + creative direction (script, settings)
