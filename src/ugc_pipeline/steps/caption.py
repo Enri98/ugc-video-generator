@@ -1,7 +1,5 @@
 """Caption step for the UGC pipeline.
 
-Implements SPEC.md §5 Step 9 — caption.
-
 Workflow:
 1. Run faster-whisper against the stitched MP4 audio track to produce a
    word-level transcript.
@@ -12,9 +10,8 @@ Workflow:
 The step is idempotent: if ``final`` artifact exists with a non-zero size,
 the step is skipped.
 
-Language note (CLAUDE.md §5): pipeline structure is English; quoted content
-placeholders inside prompts are Italian. faster-whisper is configured with
-``language="it"`` because the voiceover script blocks are Italian.
+Language note: pipeline structure and code are English; the voiceover script
+blocks are Italian, so faster-whisper is configured with ``language="it"``.
 """
 
 from __future__ import annotations

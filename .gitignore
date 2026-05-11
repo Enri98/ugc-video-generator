@@ -13,7 +13,7 @@ NOTES.md
 *_DESIGN.md
 *_NOTES.md
 CLAUDE.md
-
+.claude/
 
 # Brand-specific configs and prompts
 config/brand_guidelines.yaml
@@ -84,7 +84,6 @@ Thumbs.db
 *.bak
 scratch/
 notes.local.md
-.claude/
 
 # Ad-hoc one-off scripts (gitignored except .example.yaml)
 scripts/adhoc/*

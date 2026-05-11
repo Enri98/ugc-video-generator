@@ -57,7 +57,7 @@ def _make_video_spec(
             "Talent's hands cradle the mug; steam rises into morning light",
         ]
     if script_blocks is None:
-        # Italian content per CLAUDE.md rule
+        # Italian narrative content (voiceover language convention)
         script_blocks = [
             "",
             "Questo momento è solo tuo.",
