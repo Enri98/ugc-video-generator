@@ -53,6 +53,7 @@ post_production:
   video_height: 1280           # final video pixel height (9:16 vertical)
   caption_font: "Arial"
   caption_font_size: 44        # scaled down for 720p vs 1080p
+  caption_whisper_model_size: "base"   # faster-whisper model. base = fast/cheap but weak on non-English + brand names; small = +250MB, much better Italian accuracy; medium = +750MB, near-human.
 
 cleanup:
   keep_raw_clips: false

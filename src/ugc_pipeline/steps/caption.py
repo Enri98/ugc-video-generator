@@ -270,6 +270,7 @@ async def run_caption(
     video_h: int = 1280,
     font: str = "Arial",
     font_size: int = 44,
+    whisper_model_size: str = "base",
 ) -> Path:
     """Transcribe, render subtitles, and burn captions into the stitched video.
 
@@ -328,7 +329,9 @@ async def run_caption(
     # ------------------------------------------------------------------
     # Transcription (run in thread pool to avoid blocking the event loop)
     # ------------------------------------------------------------------
-    segments = await asyncio.to_thread(transcribe_with_whisper, stitched_path)
+    segments = await asyncio.to_thread(
+        transcribe_with_whisper, stitched_path, model_size=whisper_model_size
+    )
 
     if not segments:
         log.warning(
