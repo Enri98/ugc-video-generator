@@ -12,18 +12,7 @@ yields N videos; each video is composed of K image-to-video clips that are
 trimmed, stitched, and captioned. State is checkpointed to disk between every
 step so any failure is resumable without re-spending on generative APIs.
 
-```mermaid
-flowchart LR
-    A[Drive poll] --> B[Product analyst]
-    B --> C[Creative director]
-    C --> D[First frame]
-    D --> E[Veo i2v]
-    E --> F[Trim]
-    F --> G[Stitch]
-    G --> H[Caption burn-in]
-    H --> I[Report]
-    I --> J[Drive upload]
-```
+![UGC pipeline diagram](img/ugc-diagramma.png)
 
 Two design choices shape everything else:
 
